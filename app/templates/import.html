@@ -1,0 +1,270 @@
+{% extends "base.html" %}
+{% block title %}Import Sites — console-check{% endblock %}
+{% block content %}
+<h1>Import Master Site List</h1>
+
+<!-- Step 1: File Upload -->
+<div id="upload-section" class="card">
+    <h2>Upload Spreadsheet</h2>
+    <p>Upload an Excel (.xlsx) or CSV file containing your master site list.</p>
+    <div class="upload-zone" id="drop-zone">
+        <p>Drag & drop file here or click to browse</p>
+        <input type="file" id="file-input" accept=".xlsx,.xls,.csv" style="display:none">
+    </div>
+    <div id="upload-status"></div>
+</div>
+
+<!-- Step 2: Column Mapping (hidden until upload) -->
+<div id="mapping-section" class="card" style="display:none">
+    <h2>Map Columns</h2>
+    <p>Match your spreadsheet columns to the required fields.</p>
+
+    <div id="preview-table-container"></div>
+
+    <form id="mapping-form">
+        <div class="form-grid">
+            <div class="form-group">
+                <label>Site ID *</label>
+                <select name="site_id" required></select>
+            </div>
+            <div class="form-group">
+                <label>City *</label>
+                <select name="city" required></select>
+            </div>
+            <div class="form-group">
+                <label>State *</label>
+                <select name="state" required></select>
+            </div>
+            <div class="form-group">
+                <label>Bank/Customer Name *</label>
+                <select name="bank_name" required></select>
+            </div>
+            <div class="form-group">
+                <label>Site Type (single/ha) *</label>
+                <select name="site_type" required></select>
+            </div>
+            <div class="form-group">
+                <label>Full Address</label>
+                <select name="full_address"></select>
+            </div>
+            <div class="form-group">
+                <label>Old Primary Hostname *</label>
+                <select name="old_primary_hostname" required></select>
+            </div>
+            <div class="form-group">
+                <label>Old Secondary Hostname</label>
+                <select name="old_secondary_hostname"></select>
+            </div>
+            <div class="form-group">
+                <label>New Primary Hostname *</label>
+                <select name="new_primary_hostname" required></select>
+            </div>
+            <div class="form-group">
+                <label>New Secondary Hostname</label>
+                <select name="new_secondary_hostname"></select>
+            </div>
+        </div>
+        <input type="hidden" id="file-path" value="">
+        <button type="submit" class="btn btn-primary">Import Sites</button>
+    </form>
+</div>
+
+<!-- Step 3: Results (hidden until import) -->
+<div id="results-section" class="card" style="display:none">
+    <h2>Import Results</h2>
+    <div id="results-content"></div>
+</div>
+
+<!-- Step 4: Unresolved UNLOCODEs -->
+<div id="unresolved-section" class="card" style="display:none">
+    <h2>Unresolved UNLOCODEs</h2>
+    <p>These sites could not be automatically matched to a UNLOCODE. Enter the code manually.</p>
+    <table class="data-table" id="unresolved-table">
+        <thead>
+            <tr><th>Site ID</th><th>City</th><th>State</th><th>UNLOCODE</th><th>Action</th></tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+let uploadedFilePath = '';
+
+// File upload handling
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+async function handleFile(file) {
+    const status = document.getElementById('upload-status');
+    status.textContent = 'Uploading...';
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+        const resp = await fetch('/api/import/upload', { method: 'POST', body: formData });
+        if (!resp.ok) { const err = await resp.json(); throw new Error(err.detail || 'Upload failed'); }
+        const data = await resp.json();
+
+        uploadedFilePath = data.file_path;
+        document.getElementById('file-path').value = data.file_path;
+        status.textContent = `Uploaded: ${file.name} (${data.total_rows} data rows)`;
+
+        buildMappingUI(data.headers, data.sample_rows);
+        document.getElementById('mapping-section').style.display = '';
+    } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+    }
+}
+
+function buildMappingUI(headers, sampleRows) {
+    // Build preview table
+    const container = document.getElementById('preview-table-container');
+    let html = '<table class="data-table"><thead><tr>';
+    headers.forEach((h, i) => { html += `<th>${i}: ${h}</th>`; });
+    html += '</tr></thead><tbody>';
+    sampleRows.forEach(row => {
+        html += '<tr>';
+        row.forEach(cell => { html += `<td>${cell}</td>`; });
+        html += '</tr>';
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+
+    // Populate dropdowns
+    const selects = document.querySelectorAll('#mapping-form select');
+    selects.forEach(select => {
+        const isOptional = !select.hasAttribute('required');
+        select.innerHTML = isOptional ? '<option value="">— None —</option>' : '<option value="">— Select —</option>';
+        headers.forEach((h, i) => {
+            select.innerHTML += `<option value="${i}">${i}: ${h}</option>`;
+        });
+    });
+}
+
+// Import execution
+document.getElementById('mapping-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const getVal = name => {
+        const v = form.elements[name].value;
+        return v === '' ? null : parseInt(v);
+    };
+
+    const body = {
+        file_path: uploadedFilePath,
+        column_map: {
+            site_id: getVal('site_id'),
+            city: getVal('city'),
+            state: getVal('state'),
+            bank_name: getVal('bank_name'),
+            site_type: getVal('site_type'),
+            old_primary_hostname: getVal('old_primary_hostname'),
+            old_secondary_hostname: getVal('old_secondary_hostname'),
+            new_primary_hostname: getVal('new_primary_hostname'),
+            new_secondary_hostname: getVal('new_secondary_hostname'),
+            full_address: getVal('full_address'),
+        }
+    };
+
+    try {
+        const resp = await fetch('/api/import/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!resp.ok) { const err = await resp.json(); throw new Error(err.detail || 'Import failed'); }
+        const result = await resp.json();
+        showResults(result);
+    } catch (err) {
+        document.getElementById('results-content').textContent = 'Error: ' + err.message;
+        document.getElementById('results-section').style.display = '';
+    }
+});
+
+function showResults(result) {
+    const section = document.getElementById('results-section');
+    section.style.display = '';
+
+    let html = `<div class="stats-row">
+        <div class="stat"><span class="stat-value">${result.total}</span><span class="stat-label">Total Rows</span></div>
+        <div class="stat"><span class="stat-value">${result.imported}</span><span class="stat-label">Imported</span></div>
+        <div class="stat"><span class="stat-value">${result.resolved}</span><span class="stat-label">UNLOCODE Resolved</span></div>
+        <div class="stat"><span class="stat-value">${result.unresolved}</span><span class="stat-label">Unresolved</span></div>
+    </div>`;
+
+    if (result.errors.length > 0) {
+        html += '<h3>Errors</h3><ul>';
+        result.errors.forEach(e => { html += `<li>${e}</li>`; });
+        html += '</ul>';
+    }
+
+    document.getElementById('results-content').innerHTML = html;
+
+    if (result.unresolved_sites.length > 0) {
+        showUnresolved(result.unresolved_sites);
+    }
+}
+
+function showUnresolved(sites) {
+    const section = document.getElementById('unresolved-section');
+    section.style.display = '';
+    const tbody = document.querySelector('#unresolved-table tbody');
+    tbody.innerHTML = '';
+
+    sites.forEach(site => {
+        const tr = document.createElement('tr');
+        const sugOptions = site.suggestions.map(s => `<option value="${s.code}">${s.code} - ${s.name} (${s.score}%)</option>`).join('');
+        tr.innerHTML = `
+            <td>${site.site_id}</td>
+            <td>${site.city}</td>
+            <td>${site.state}</td>
+            <td>
+                <select class="unlocode-select">
+                    <option value="">— Select —</option>
+                    ${sugOptions}
+                </select>
+                <input type="text" class="unlocode-manual" placeholder="Or type code" maxlength="3" style="width:60px;margin-left:4px">
+            </td>
+            <td><button class="btn btn-sm" onclick="resolveUnlocode('${site.site_id}', this)">Save</button></td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+async function resolveUnlocode(siteId, btn) {
+    const row = btn.closest('tr');
+    const selectVal = row.querySelector('.unlocode-select').value;
+    const manualVal = row.querySelector('.unlocode-manual').value.trim().toUpperCase();
+    const code = manualVal || selectVal;
+
+    if (!code) { alert('Please select or enter a UNLOCODE'); return; }
+
+    try {
+        const resp = await fetch(`/api/import/resolve/${siteId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ unlocode: code }),
+        });
+        if (!resp.ok) throw new Error('Failed to resolve');
+        row.style.opacity = '0.5';
+        btn.textContent = 'Saved';
+        btn.disabled = true;
+    } catch (err) {
+        alert('Error: ' + err.message);
+    }
+}
+</script>
+{% endblock %}

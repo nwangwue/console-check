@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — console-check{% endblock %}
+{% block content %}
+<h1>Readiness Dashboard</h1>
+
+<div class="summary-cards" id="summary-cards">
+    <div class="summary-card"><div class="count">—</div><div class="label">Total</div></div>
+    <div class="summary-card ready"><div class="count">—</div><div class="label">Ready</div></div>
+    <div class="summary-card issues"><div class="count">—</div><div class="label">Issues</div></div>
+    <div class="summary-card partial"><div class="count">—</div><div class="label">Partial</div></div>
+    <div class="summary-card not_checked"><div class="count">—</div><div class="label">Not Checked</div></div>
+</div>
+
+<div class="filter-bar">
+    <select id="filter-status" onchange="loadDashboard()">
+        <option value="">All Statuses</option>
+        <option value="not_checked">Not Checked</option>
+        <option value="ready">Ready</option>
+        <option value="issues">Issues</option>
+        <option value="partial">Partial</option>
+    </select>
+    <select id="filter-type" onchange="loadDashboard()">
+        <option value="">All Types</option>
+        <option value="single">Single</option>
+        <option value="ha">HA</option>
+    </select>
+    <input type="text" id="filter-state" placeholder="State (e.g. TX)" maxlength="2"
+           style="width:80px" onchange="loadDashboard()">
+    <button class="btn btn-primary" onclick="exportCSV()">Export CSV</button>
+    <span id="dash-count" style="color:#64748b;font-size:0.85rem;margin-left:auto"></span>
+</div>
+
+<table class="data-table" id="dash-table">
+    <thead>
+        <tr>
+            <th>Site ID</th>
+            <th>City</th>
+            <th>State</th>
+            <th>Bank Name</th>
+            <th>UNLOCODE</th>
+            <th>Type</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody></tbody>
+</table>
+
+<div class="pagination" id="pagination"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPage = 1;
+
+async function loadSummary() {
+    const resp = await fetch('/api/dashboard/summary');
+    const data = await resp.json();
+    const cards = document.getElementById('summary-cards');
+    const counts = cards.querySelectorAll('.count');
+    counts[0].textContent = data.total;
+    counts[1].textContent = data.ready;
+    counts[2].textContent = data.issues;
+    counts[3].textContent = data.partial;
+    counts[4].textContent = data.not_checked;
+}
+
+async function loadDashboard(page = 1) {
+    currentPage = page;
+    const status = document.getElementById('filter-status').value;
+    const siteType = document.getElementById('filter-type').value;
+    const state = document.getElementById('filter-state').value;
+
+    const params = new URLSearchParams({ status, site_type: siteType, state, page, per_page: 25 });
+    const resp = await fetch(`/api/dashboard/sites?${params}`);
+    const data = await resp.json();
+
+    document.getElementById('dash-count').textContent = `${data.total} site(s)`;
+
+    const tbody = document.querySelector('#dash-table tbody');
+    tbody.innerHTML = '';
+    data.items.forEach(site => {
+        const tr = document.createElement('tr');
+        tr.className = 'clickable';
+        tr.onclick = () => window.location.href = `/sites/${site.id}/verify`;
+        tr.innerHTML = `
+            <td>${site.id}</td>
+            <td>${site.city}</td>
+            <td>${site.state}</td>
+            <td>${site.bank_name}</td>
+            <td>${site.unlocode || '—'}</td>
+            <td>${site.site_type.toUpperCase()}</td>
+            <td><span class="badge badge-${site.status}">${site.status.replace('_', ' ')}</span></td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    const totalPages = Math.ceil(data.total / data.per_page);
+    const pag = document.getElementById('pagination');
+    pag.innerHTML = '';
+    if (totalPages > 1) {
+        for (let i = 1; i <= Math.min(totalPages, 10); i++) {
+            const btn = document.createElement('button');
+            btn.textContent = i;
+            if (i === currentPage) btn.className = 'active';
+            btn.onclick = () => loadDashboard(i);
+            pag.appendChild(btn);
+        }
+    }
+}
+
+function exportCSV() {
+    const status = document.getElementById('filter-status').value;
+    const siteType = document.getElementById('filter-type').value;
+    const state = document.getElementById('filter-state').value;
+    const params = new URLSearchParams({ status, site_type: siteType, state });
+    window.location.href = `/api/dashboard/export?${params}`;
+}
+
+loadSummary();
+loadDashboard();
+</script>
+{% endblock %}

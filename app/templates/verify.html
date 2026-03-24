@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Verify — console-check{% endblock %}
+{% block content %}
+
+<div id="verify-app">
+    <div id="loading">Loading site data...</div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SITE_ID = '{{ site_id }}';
+const ROLE_LABELS = {
+    'old_primary': 'Old Primary',
+    'old_secondary': 'Old Secondary',
+    'new_primary': 'New Primary',
+    'new_secondary': 'New Secondary',
+};
+
+let siteData = null;
+let verificationStatus = null;
+
+async function loadSite() {
+    try {
+        const [siteResp, statusResp] = await Promise.all([
+            fetch(`/api/sites/${SITE_ID}`),
+            fetch(`/api/verify/${SITE_ID}/status`),
+        ]);
+
+        if (!siteResp.ok) {
+            document.getElementById('verify-app').innerHTML = '<div class="card"><h2>Site not found</h2><p>Could not load site data.</p></div>';
+            return;
+        }
+
+        siteData = await siteResp.json();
+        verificationStatus = await statusResp.json();
+        render();
+    } catch (err) {
+        document.getElementById('verify-app').innerHTML = `<div class="card"><p>Error: ${err.message}</p></div>`;
+    }
+}
+
+function render() {
+    const app = document.getElementById('verify-app');
+    const engineer = localStorage.getItem('engineer_name') || '';
+
+    let html = `
+    <div class="site-header">
+        <div class="site-info">
+            <h2>${siteData.id} — ${siteData.bank_name}</h2>
+            <p>${siteData.city}, ${siteData.state} &middot; ${siteData.site_type.toUpperCase()} site &middot;
+               <span class="badge badge-${siteData.status}">${siteData.status.replace('_', ' ')}</span></p>
+        </div>
+        <div class="cp-key" title="Click to copy" onclick="navigator.clipboard.writeText(this.textContent.trim())">${siteData.cp_search_key || 'No UNLOCODE'}</div>
+    </div>
+
+    <div class="card" style="margin-bottom:1rem">
+        <label style="font-size:0.85rem;font-weight:600;color:#475569">Engineer Name</label>
+        <input type="text" id="engineer-name" value="${engineer}" placeholder="Your name"
+               style="margin-top:0.25rem;width:200px" onchange="localStorage.setItem('engineer_name', this.value)">
+    </div>
+
+    <div class="port-cards">`;
+
+    // Build port cards from status data
+    const ports = verificationStatus.ports;
+    ports.forEach(port => {
+        const verdictClass = port.verdict ? `verified-${port.verdict}` : '';
+        html += `
+        <div class="port-card ${verdictClass}" id="port-card-${port.port}">
+            <div class="port-card-header">
+                <span class="port-label">Port ${port.port}</span>
+                <span class="port-role">${ROLE_LABELS[port.role] || port.role}</span>
+            </div>
+            <div class="expected-hostname">Expected: ${port.expected_hostname}</div>
+            <textarea id="output-${port.port}" placeholder="Paste console output for Port ${port.port} here..."></textarea>
+            <button class="btn btn-primary" onclick="verifyPort(${port.port})">Check Port ${port.port}</button>
+            <div class="verdict-display" id="verdict-${port.port}" style="display:${port.verdict ? '' : 'none'}">
+                ${renderVerdict(port)}
+            </div>
+        </div>`;
+    });
+
+    html += `</div>
+
+    <div class="card">
+        <h3>Site Status Summary</h3>
+        <p>Overall: <span class="badge badge-${verificationStatus.status}">${verificationStatus.status.replace('_', ' ')}</span></p>
+    </div>`;
+
+    app.innerHTML = html;
+}
+
+function renderVerdict(port) {
+    if (!port.verdict) return '';
+
+    let html = `<strong>Verdict:</strong> <span class="badge badge-${port.verdict}">${port.verdict.replace('_', ' ')}</span>`;
+
+    if (port.found_hostname) {
+        html += ` &mdash; Found: <strong>${port.found_hostname}</strong>`;
+    } else if (port.verdict === 'no_response') {
+        html += ' &mdash; No hostname could be extracted';
+    }
+
+    if (port.swap_details) {
+        html += `<br><em>${port.swap_details}</em>`;
+
+        // Parse "matches Port X" to get the other port number
+        const match = port.swap_details.match(/Port (\d)/);
+        if (match) {
+            const otherPort = parseInt(match[1]);
+            html += `<br><button class="btn btn-warning btn-sm" style="margin-top:0.5rem"
+                       onclick="acceptSwap(${port.port}, ${otherPort})">Accept Swap (Port ${port.port} ↔ Port ${otherPort})</button>`;
+        }
+    }
+
+    if (port.timestamp) {
+        html += `<br><small style="color:#64748b">Checked: ${port.timestamp}</small>`;
+    }
+
+    return html;
+}
+
+async function verifyPort(port) {
+    const rawOutput = document.getElementById(`output-${port}`).value;
+    if (!rawOutput.trim()) {
+        alert('Please paste console output first.');
+        return;
+    }
+
+    const engineer = document.getElementById('engineer-name').value;
+
+    try {
+        const resp = await fetch(`/api/verify/${SITE_ID}/port/${port}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ raw_output: rawOutput, engineer }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            alert('Error: ' + (err.detail || 'Verification failed'));
+            return;
+        }
+
+        // Reload status to get updated verdicts
+        const statusResp = await fetch(`/api/verify/${SITE_ID}/status`);
+        verificationStatus = await statusResp.json();
+
+        // Reload site for updated status
+        const siteResp = await fetch(`/api/sites/${SITE_ID}`);
+        siteData = await siteResp.json();
+
+        render();
+    } catch (err) {
+        alert('Error: ' + err.message);
+    }
+}
+
+async function acceptSwap(portA, portB) {
+    try {
+        const resp = await fetch(`/api/verify/${SITE_ID}/accept-swap`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ port_a: portA, port_b: portB }),
+        });
+
+        if (!resp.ok) {
+            alert('Failed to accept swap');
+            return;
+        }
+
+        // Reload everything
+        const [siteResp, statusResp] = await Promise.all([
+            fetch(`/api/sites/${SITE_ID}`),
+            fetch(`/api/verify/${SITE_ID}/status`),
+        ]);
+        siteData = await siteResp.json();
+        verificationStatus = await statusResp.json();
+        render();
+    } catch (err) {
+        alert('Error: ' + err.message);
+    }
+}
+
+loadSite();
+</script>
+{% endblock %}
