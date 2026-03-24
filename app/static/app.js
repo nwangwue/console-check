@@ -1,1 +1,0 @@
-// console-check frontend JS
