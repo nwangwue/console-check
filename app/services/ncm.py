@@ -43,9 +43,11 @@ SELECTORS = {
     "login_error": '.error, .alert-danger, [role="alert"], .login-error',
 
     # MFA / Two-factor authentication
-    "mfa_input": 'input[name="otp"], input[name="mfa"], input[name="code"], input[name="token"], input[name="totp"], input[type="tel"][autocomplete="one-time-code"], input[placeholder*="erification"], input[placeholder*="ode"], input[placeholder*="otp"], input[aria-label*="erification"], input[aria-label*="ode"]',
-    "mfa_submit": 'button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue"), button:has-text("Confirm")',
-    "mfa_page": 'text=/erification|two.factor|2fa|authenticator|one.time|MFA|security code/i, [class*="mfa"], [class*="otp"], [class*="two-factor"], [class*="verification"]',
+    # NOTE: NCM uses Ember.js which renders a hidden input (type="hidden") alongside
+    # a visible text input. We must exclude hidden inputs to avoid clicking invisible elements.
+    "mfa_input": 'input[type="text"][name="token"], input[type="number"][name="token"], input.ember-text-field:not([type="hidden"]), input[name="otp"]:not([type="hidden"]), input[name="mfa"]:not([type="hidden"]), input[name="code"]:not([type="hidden"]), input[name="token"]:not([type="hidden"]), input[name="totp"]:not([type="hidden"]), input[placeholder*="oken"]:not([type="hidden"]), input[placeholder*="MFA"]:not([type="hidden"])',
+    "mfa_submit": 'button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue"), button:has-text("Confirm"), button:has-text("Log In"), button:has-text("Sign In")',
+    "mfa_page": 'text=/MFA token|erification|two.factor|2fa|authenticator|one.time|MFA|security code/i, [class*="mfa"], [class*="otp"], [class*="two-factor"], [class*="verification"]',
 
     # Dashboard / logged-in indicator
     "dashboard": '.dashboard, #app, [data-testid="main-content"], nav, .main-content',
@@ -231,10 +233,37 @@ def _cmd_submit_mfa(page, parser, code):
     """
     from playwright.sync_api import TimeoutError as PwTimeout
 
-    # Find and fill the MFA input
-    mfa_input = page.locator(SELECTORS["mfa_input"]).first
-    mfa_input.click()
-    mfa_input.fill(code)
+    # Find a VISIBLE MFA input — try selector-based first, then JS fallback
+    filled = False
+    try:
+        mfa_input = page.locator(SELECTORS["mfa_input"])
+        # Iterate to find one that's actually visible
+        for i in range(mfa_input.count()):
+            el = mfa_input.nth(i)
+            if el.is_visible(timeout=1000):
+                el.click()
+                el.fill(code)
+                filled = True
+                break
+    except Exception:
+        pass
+
+    if not filled:
+        # JS fallback: find any visible text/number input on the page that looks like MFA
+        page.evaluate(f"""(code) => {{
+            const inputs = document.querySelectorAll('input[type="text"], input[type="number"], input[type="tel"], input:not([type])');
+            for (const inp of inputs) {{
+                if (inp.offsetParent !== null && inp.type !== 'hidden') {{
+                    inp.focus();
+                    inp.value = code;
+                    inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    break;
+                }}
+            }}
+        }}""", code)
+        filled = True
+        time.sleep(0.5)
 
     # Submit
     page.locator(SELECTORS["mfa_submit"]).first.click()
