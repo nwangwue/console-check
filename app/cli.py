@@ -236,9 +236,21 @@ def _ensure_ncm_login():
         raise RuntimeError("Password required")
 
     render_status("Logging in...")
-    success = ncm.login(username, password)
+    result = ncm.login(username, password)
 
-    if not success:
+    if result == "mfa_required":
+        console.print("[yellow]MFA verification required[/yellow]")
+        mfa_code = questionary.text("Enter MFA token:").ask()
+        if not mfa_code:
+            raise RuntimeError("MFA token required")
+
+        render_status("Submitting MFA token...")
+        mfa_success = ncm.submit_mfa(mfa_code.strip())
+
+        if not mfa_success:
+            raise RuntimeError("MFA verification failed. Check your token and try again.")
+
+    elif not result:
         raise RuntimeError("NCM login failed. Check your credentials and try again.")
 
     render_status("Logged into NCM ✓", style="green")

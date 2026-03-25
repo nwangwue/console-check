@@ -42,6 +42,11 @@ SELECTORS = {
     "login_submit": 'button[type="submit"], input[type="submit"], button:has-text("Log In"), button:has-text("Sign In")',
     "login_error": '.error, .alert-danger, [role="alert"], .login-error',
 
+    # MFA / Two-factor authentication
+    "mfa_input": 'input[name="otp"], input[name="mfa"], input[name="code"], input[name="token"], input[name="totp"], input[type="tel"][autocomplete="one-time-code"], input[placeholder*="erification"], input[placeholder*="ode"], input[placeholder*="otp"], input[aria-label*="erification"], input[aria-label*="ode"]',
+    "mfa_submit": 'button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue"), button:has-text("Confirm")',
+    "mfa_page": 'text=/erification|two.factor|2fa|authenticator|one.time|MFA|security code/i, [class*="mfa"], [class*="otp"], [class*="two-factor"], [class*="verification"]',
+
     # Dashboard / logged-in indicator
     "dashboard": '.dashboard, #app, [data-testid="main-content"], nav, .main-content',
 
@@ -146,6 +151,7 @@ def _cmd_is_logged_in(page, parser):
 
 
 def _cmd_login(page, parser, username, password):
+    """Returns: True (logged in), False (failed), "mfa_required" (needs MFA token)."""
     from playwright.sync_api import TimeoutError as PwTimeout
     page.goto(NCM_URL, wait_until="domcontentloaded")
     time.sleep(2)
@@ -170,6 +176,7 @@ def _cmd_login(page, parser, username, password):
     time.sleep(3)
     page.wait_for_load_state("domcontentloaded")
 
+    # Check for login error
     try:
         error = page.locator(SELECTORS["login_error"]).first
         if error.is_visible(timeout=2000):
@@ -177,6 +184,76 @@ def _cmd_login(page, parser, username, password):
     except Exception:
         pass
 
+    # Check if MFA is required
+    if _is_mfa_page(page):
+        return "mfa_required"
+
+    # Check if we're still on login
+    url = page.url.lower()
+    if "login" in url or "signin" in url:
+        return False
+
+    return True
+
+
+def _is_mfa_page(page) -> bool:
+    """Detect if the current page is an MFA/verification challenge."""
+    from playwright.sync_api import TimeoutError as PwTimeout
+
+    # Check URL for MFA hints
+    url = page.url.lower()
+    if any(kw in url for kw in ("mfa", "otp", "verify", "2fa", "two-factor", "challenge", "totp")):
+        return True
+
+    # Check for MFA input field
+    try:
+        mfa_input = page.locator(SELECTORS["mfa_input"]).first
+        if mfa_input.is_visible(timeout=2000):
+            return True
+    except (PwTimeout, Exception):
+        pass
+
+    # Check for MFA page markers (text content)
+    try:
+        mfa_marker = page.locator(SELECTORS["mfa_page"]).first
+        if mfa_marker.is_visible(timeout=1000):
+            return True
+    except (PwTimeout, Exception):
+        pass
+
+    return False
+
+
+def _cmd_submit_mfa(page, parser, code):
+    """Submit MFA token and check if login completes.
+
+    Returns: True (logged in), False (MFA failed / still on MFA page).
+    """
+    from playwright.sync_api import TimeoutError as PwTimeout
+
+    # Find and fill the MFA input
+    mfa_input = page.locator(SELECTORS["mfa_input"]).first
+    mfa_input.click()
+    mfa_input.fill(code)
+
+    # Submit
+    page.locator(SELECTORS["mfa_submit"]).first.click()
+    time.sleep(3)
+    page.wait_for_load_state("domcontentloaded")
+
+    # Check for errors
+    try:
+        error = page.locator(SELECTORS["login_error"]).first
+        if error.is_visible(timeout=2000):
+            return False
+    except Exception:
+        pass
+
+    # Still on MFA page? Failed.
+    if _is_mfa_page(page):
+        return False
+
+    # Still on login page? Failed.
     url = page.url.lower()
     if "login" in url or "signin" in url:
         return False
@@ -342,6 +419,7 @@ def _cmd_go_back(page, parser):
 _COMMANDS = {
     "is_logged_in": _cmd_is_logged_in,
     "login": _cmd_login,
+    "submit_mfa": _cmd_submit_mfa,
     "search_devices": _cmd_search_devices,
     "select_device": _cmd_select_device,
     "open_console": _cmd_open_console,
@@ -410,8 +488,13 @@ class NCMAutomation:
     def is_logged_in(self) -> bool:
         return self._call("is_logged_in")
 
-    def login(self, username: str, password: str) -> bool:
+    def login(self, username: str, password: str) -> bool | str:
+        """Returns True (success), False (failed), or "mfa_required"."""
         return self._call("login", username, password)
+
+    def submit_mfa(self, code: str) -> bool:
+        """Submit MFA/2FA verification code. Returns True if login completes."""
+        return self._call("submit_mfa", code)
 
     def search_devices(self, search_key: str) -> list[DeviceInfo]:
         return self._call("search_devices", search_key)
