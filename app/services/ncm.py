@@ -378,94 +378,41 @@ def _cmd_open_console(page, parser):
     page.locator(SELECTORS["open_console_btn"]).first.click()
     time.sleep(5)
 
-    # Wait for the console/terminal to appear.
-    # NCM's DOM structure may vary — try multiple detection strategies.
-    terminal_found = False
+    # Quick check for known terminal selectors
+    terminal_selectors = [
+        SELECTORS["terminal"],
+        'iframe', 'canvas',
+        '[class*="console"]', '[class*="Console"]',
+        '[class*="term"]', '[class*="shell"]',
+        '[id*="terminal"]', '[id*="console"]',
+        '[role="application"]', 'pre',
+    ]
 
-    # Strategy 1: known terminal selectors
-    try:
-        page.wait_for_selector(SELECTORS["terminal"], timeout=10000)
-        terminal_found = True
-    except PwTimeout:
-        pass
-
-    if not terminal_found:
-        # Strategy 2: look for iframe (console may load in an iframe)
+    for selector in terminal_selectors:
         try:
-            page.wait_for_selector('iframe', timeout=5000)
-            terminal_found = True
-        except PwTimeout:
-            pass
-
-    if not terminal_found:
-        # Strategy 3: look for canvas (some terminal renderers use canvas)
-        try:
-            page.wait_for_selector('canvas', timeout=5000)
-            terminal_found = True
-        except PwTimeout:
-            pass
-
-    if not terminal_found:
-        # Strategy 4: poll for any new significant content change on the page
-        # The console is open if the page URL or content changed after clicking
-        # Wait up to 360s, checking every 5s for terminal-like content
-        for _ in range(70):  # 70 * 5s = 350s
-            time.sleep(5)
-
-            # Check all terminal-like selectors
-            for selector in [
-                SELECTORS["terminal"],
-                'iframe',
-                'canvas',
-                '[class*="console"]',
-                '[class*="Console"]',
-                '[class*="term"]',
-                '[class*="shell"]',
-                '[id*="terminal"]',
-                '[id*="console"]',
-                'pre',
-            ]:
-                try:
-                    el = page.locator(selector).first
-                    if el.is_visible(timeout=500):
-                        terminal_found = True
-                        break
-                except Exception:
-                    continue
-
-            if terminal_found:
-                break
-
-            # Also check if there's a text input / textarea that appeared (some consoles use this)
-            try:
-                has_console = page.evaluate("""() => {
-                    // Look for anything that smells like a terminal
-                    const candidates = [
-                        ...document.querySelectorAll('[class*="xterm"], [class*="terminal"], [class*="console"], [class*="Console"]'),
-                        ...document.querySelectorAll('iframe, canvas'),
-                        ...document.querySelectorAll('[role="application"], [role="textbox"]'),
-                    ];
-                    return candidates.some(el => el.offsetParent !== null || el.offsetHeight > 0);
-                }""")
-                if has_console:
-                    terminal_found = True
-                    break
-            except Exception:
-                pass
-
-    if not terminal_found:
-        # Save a debug screenshot so the user can report what the page looks like
-        try:
-            page.screenshot(path="ncm_console_debug.png")
+            el = page.locator(selector).first
+            if el.is_visible(timeout=2000):
+                time.sleep(2)
+                return "auto_detected"
         except Exception:
-            pass
-        raise RuntimeError(
-            "Could not detect the console terminal. A debug screenshot has been "
-            "saved to ncm_console_debug.png — please share it so we can update "
-            "the selectors."
-        )
+            continue
 
-    time.sleep(3)
+    # Could not auto-detect — return so the CLI can ask the user
+    # Save a debug screenshot to an absolute path
+    debug_path = str(Path.home() / ".console-check" / "ncm_console_debug.png")
+    try:
+        Path(debug_path).parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=debug_path)
+    except Exception:
+        debug_path = None
+
+    return {"status": "manual_confirm_needed", "screenshot": debug_path}
+
+
+def _cmd_wait_for_user(page, parser):
+    """Called after user confirms the console is ready. Just a small pause."""
+    time.sleep(1)
+    return True
 
 
 def _cmd_check_port(page, parser, port_number):
@@ -598,6 +545,7 @@ _COMMANDS = {
     "search_devices": _cmd_search_devices,
     "select_device": _cmd_select_device,
     "open_console": _cmd_open_console,
+    "wait_for_user": _cmd_wait_for_user,
     "check_port": _cmd_check_port,
     "check_all_ports": _cmd_check_all_ports,
     "take_screenshot": _cmd_take_screenshot,
@@ -678,7 +626,12 @@ class NCMAutomation:
         return self._call("select_device", device.row_index)
 
     def open_console(self):
+        """Returns "auto_detected" or {"status": "manual_confirm_needed", "screenshot": path}."""
         return self._call("open_console")
+
+    def wait_for_user(self):
+        """Call after user confirms console is ready."""
+        return self._call("wait_for_user")
 
     def check_port(self, port_number: int) -> PortResult:
         return self._call("check_port", port_number)

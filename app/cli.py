@@ -171,8 +171,23 @@ def lookup_flow():
             render_status(f"Opening {device.name}...")
             ncm.select_device(device)
 
-            render_status("Navigating to console...")
-            ncm.open_console()
+            render_status("Navigating to console... (this may take a while)")
+            console_result = ncm.open_console()
+
+            if isinstance(console_result, dict) and console_result.get("status") == "manual_confirm_needed":
+                # Could not auto-detect the console — ask the user
+                screenshot_path = console_result.get("screenshot")
+                console.print()
+                console.print("[yellow]Could not auto-detect the console terminal.[/yellow]")
+                if screenshot_path:
+                    console.print(f"[dim]Debug screenshot saved to: {screenshot_path}[/dim]")
+                console.print("[bold]Check the browser window — is the console/terminal visible?[/bold]")
+
+                ready = questionary.confirm("Is the console ready in the browser?", default=True).ask()
+                if not ready:
+                    console.print("[yellow]Skipping this device.[/yellow]")
+                    continue
+                ncm.wait_for_user()
 
             render_status("Checking all 4 console ports...")
             results = ncm.check_all_ports()
@@ -180,11 +195,8 @@ def lookup_flow():
             render_port_results(results)
 
         except RuntimeError as e:
-            console.print(f"[red]Error: {e}[/red]")
+            console.print(f"\n[red]Error: {e}[/red]")
             console.print("[dim]The NCM UI may have changed or the device may be unresponsive.[/dim]")
-            # Save debug screenshot
-            ncm.take_screenshot()
-            console.print("[dim]Debug screenshot saved to ncm_debug.png[/dim]")
 
         # Ask what to do next
         next_action = questionary.select("What next?", choices=[
