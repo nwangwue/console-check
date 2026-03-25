@@ -6,7 +6,13 @@ Engineers use this tool to import a master site list, look up customers by name 
 
 ## Quick Start
 
-```bash
+```powershell
+# One-time setup: create venv OUTSIDE OneDrive (OneDrive corrupts .venv symlinks)
+python -m uv venv C:\Users\%USERNAME%\.venvs\console-check --python 3.14
+
+# Set this env var so uv finds the venv (add to your PowerShell profile for permanence)
+$env:UV_PROJECT_ENVIRONMENT = "C:\Users\$env:USERNAME\.venvs\console-check"
+
 # Install dependencies
 python -m uv sync
 
@@ -14,7 +20,15 @@ python -m uv sync
 python -m uv run console-check
 ```
 
-> **Note:** If your `.venv` is outside the project directory (e.g., due to OneDrive sync issues), set `UV_PROJECT_ENVIRONMENT` to point to it before running `uv` commands.
+### Why the external venv?
+
+WWT syncs the project folder via OneDrive, which corrupts Python virtual environments (deletes symlinked executables, locks `.exe` files). Placing `.venv` outside OneDrive avoids this entirely.
+
+To make it permanent, add this to your PowerShell profile (`$PROFILE`):
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = "C:\Users\$env:USERNAME\.venvs\console-check"
+```
 
 ## What It Does
 

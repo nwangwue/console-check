@@ -8,6 +8,10 @@ build/
 
 # Virtual environment
 .venv/
+.venv_new/
+
+# Environment
+.env
 
 # Database
 *.db
