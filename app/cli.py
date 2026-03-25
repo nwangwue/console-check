@@ -197,10 +197,7 @@ def lookup_flow():
 
         # Go back to device list
         try:
-            ncm.page.go_back()
-            ncm.page.go_back()
-            import time
-            time.sleep(2)
+            ncm.go_back()
         except Exception:
             # Re-search if navigation fails
             render_status(f"Re-searching for '{search_key}'...")
@@ -217,7 +214,7 @@ def _ensure_ncm_login():
     """Ensure NCM browser is started and logged in."""
     global ncm
 
-    if not ncm._context:
+    if not ncm._started:
         render_status("Launching browser...")
         ncm.start()
 

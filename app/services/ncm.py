@@ -1,10 +1,16 @@
-"""Playwright-based browser automation for Cradlepoint NCM console port access."""
+"""Playwright-based browser automation for Cradlepoint NCM console port access.
+
+Playwright's sync API creates its own asyncio event loop, which conflicts with
+questionary (which also uses asyncio.run). To avoid this, all Playwright work
+runs in a dedicated background thread. The main thread calls methods that proxy
+to the background thread via a simple request/response queue.
+"""
 
 import time
-from dataclasses import dataclass, field
+import threading
+import queue
+from dataclasses import dataclass
 from pathlib import Path
-
-from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PwTimeout
 
 from app.services.hostname_parser import HostnameParser
 from app.config import NCM_URL, HEADLESS, BROWSER_TIMEOUT
@@ -28,7 +34,6 @@ class PortResult:
 
 # ── NCM UI Selectors ────────────────────────────────────────────────────────
 # Update these if NCM changes its DOM. Use browser DevTools to inspect.
-# Multiple selectors separated by commas act as fallbacks.
 SELECTORS = {
     # Login page
     "login_form": 'form, [data-testid="login-form"], .login-form',
@@ -58,349 +63,377 @@ SELECTORS = {
 }
 
 
+# ── Background Thread Worker ────────────────────────────────────────────────
+
+_SENTINEL = object()
+
+
+def _playwright_worker(
+    headless: bool,
+    timeout: int,
+    cmd_queue: queue.Queue,
+    result_queue: queue.Queue,
+):
+    """Runs in a background thread. Owns the Playwright browser and event loop."""
+    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
+    parser = HostnameParser()
+    pw = None
+    context = None
+    page = None
+
+    try:
+        user_data_dir = str(Path.home() / ".console-check" / "browser-data")
+        Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+
+        pw = sync_playwright().start()
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless,
+            viewport={"width": 1280, "height": 800},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context.set_default_timeout(timeout)
+        page = context.pages[0] if context.pages else context.new_page()
+
+        # Signal that startup is done
+        result_queue.put(("ok", None))
+
+        # Process commands until told to stop
+        while True:
+            cmd = cmd_queue.get()
+            if cmd is _SENTINEL:
+                break
+
+            method_name, args, kwargs = cmd
+            try:
+                fn = _COMMANDS[method_name]
+                ret = fn(page=page, parser=parser, *args, **kwargs)
+                result_queue.put(("ok", ret))
+            except Exception as e:
+                result_queue.put(("error", e))
+
+    except Exception as e:
+        # Startup failed
+        result_queue.put(("error", e))
+    finally:
+        try:
+            if context:
+                context.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
+# ── Command implementations (run inside the worker thread) ──────────────────
+
+def _cmd_is_logged_in(page, parser):
+    from playwright.sync_api import TimeoutError as PwTimeout
+    try:
+        page.goto(NCM_URL, wait_until="domcontentloaded")
+        time.sleep(2)
+        url = page.url.lower()
+        if "login" in url or "signin" in url or "auth" in url:
+            return False
+        try:
+            page.wait_for_selector(SELECTORS["dashboard"], timeout=5000)
+            return True
+        except PwTimeout:
+            return False
+    except Exception:
+        return False
+
+
+def _cmd_login(page, parser, username, password):
+    from playwright.sync_api import TimeoutError as PwTimeout
+    page.goto(NCM_URL, wait_until="domcontentloaded")
+    time.sleep(2)
+
+    url = page.url.lower()
+    if "login" not in url and "signin" not in url and "auth" not in url:
+        try:
+            page.wait_for_selector(SELECTORS["dashboard"], timeout=5000)
+            return True
+        except PwTimeout:
+            pass
+
+    username_input = page.locator(SELECTORS["login_username"]).first
+    username_input.click()
+    username_input.fill(username)
+
+    password_input = page.locator(SELECTORS["login_password"]).first
+    password_input.click()
+    password_input.fill(password)
+
+    page.locator(SELECTORS["login_submit"]).first.click()
+    time.sleep(3)
+    page.wait_for_load_state("domcontentloaded")
+
+    try:
+        error = page.locator(SELECTORS["login_error"]).first
+        if error.is_visible(timeout=2000):
+            return False
+    except Exception:
+        pass
+
+    url = page.url.lower()
+    if "login" in url or "signin" in url:
+        return False
+
+    return True
+
+
+def _cmd_search_devices(page, parser, search_key):
+    from playwright.sync_api import TimeoutError as PwTimeout
+    try:
+        devices_link = page.locator(SELECTORS["devices_nav"]).first
+        devices_link.click()
+        time.sleep(2)
+        page.wait_for_load_state("domcontentloaded")
+
+        search_input = page.locator(SELECTORS["device_search"]).first
+        search_input.click()
+        search_input.fill("")
+        search_input.fill(search_key)
+        time.sleep(2)
+
+        return _scrape_device_list(page)
+    except PwTimeout:
+        return []
+
+
+def _scrape_device_list(page) -> list[DeviceInfo]:
+    devices = []
+    try:
+        rows = page.locator(SELECTORS["device_rows"]).all()
+        for i, row in enumerate(rows):
+            text = row.inner_text().strip()
+            if not text:
+                continue
+            parts = text.split("\t")
+            if not parts:
+                parts = text.split("\n")
+            name = parts[0].strip() if parts else text[:50]
+            status = "unknown"
+            text_lower = text.lower()
+            if "online" in text_lower:
+                status = "online"
+            elif "offline" in text_lower:
+                status = "offline"
+            devices.append(DeviceInfo(name=name, status=status, row_index=i))
+    except Exception:
+        pass
+    return devices
+
+
+def _cmd_select_device(page, parser, row_index):
+    from playwright.sync_api import TimeoutError as PwTimeout
+    rows = page.locator(SELECTORS["device_rows"]).all()
+    if row_index < len(rows):
+        rows[row_index].click()
+        time.sleep(2)
+        page.wait_for_load_state("domcontentloaded")
+    else:
+        raise RuntimeError(f"Device row {row_index} not found")
+
+
+def _cmd_open_console(page, parser):
+    from playwright.sync_api import TimeoutError as PwTimeout
+    page.locator(SELECTORS["troubleshooting_tab"]).first.click()
+    time.sleep(2)
+
+    page.locator(SELECTORS["remote_connect"]).first.click()
+    time.sleep(2)
+
+    try:
+        page.locator(SELECTORS["console_option"]).first.click()
+        time.sleep(1)
+    except Exception:
+        pass
+
+    page.locator(SELECTORS["open_console_btn"]).first.click()
+    time.sleep(3)
+
+    page.wait_for_selector(SELECTORS["terminal"], timeout=15000)
+    time.sleep(2)
+
+
+def _cmd_check_port(page, parser, port_number):
+    if port_number not in (1, 2, 3, 4):
+        return PortResult(port=port_number, error="Invalid port number (must be 1-4)")
+
+    try:
+        terminal = page.locator(SELECTORS["terminal"]).first
+        terminal.click()
+        time.sleep(0.5)
+
+        page.keyboard.type(f"serial --force {port_number}")
+        page.keyboard.press("Enter")
+        time.sleep(3)
+
+        page.keyboard.press("Enter")
+        time.sleep(1)
+        page.keyboard.press("Enter")
+        time.sleep(2)
+
+        output = _read_terminal(page)
+
+        if not output or not output.strip():
+            page.keyboard.press("Enter")
+            time.sleep(5)
+            output = _read_terminal(page)
+
+        result = parser.parse(output)
+
+        return PortResult(
+            port=port_number,
+            raw_output=output,
+            hostname=result.hostname,
+            confidence=result.confidence,
+            error=None if output.strip() else "No response from port",
+        )
+    except Exception as e:
+        return PortResult(port=port_number, error=str(e))
+
+
+def _cmd_check_all_ports(page, parser):
+    results = []
+    for port in range(1, 5):
+        result = _cmd_check_port(page, parser, port)
+        results.append(result)
+        if port < 4:
+            time.sleep(1)
+    return results
+
+
+def _read_terminal(page) -> str:
+    try:
+        text = page.evaluate("""
+            () => {
+                const rows = document.querySelectorAll('.xterm-rows > div');
+                if (rows.length > 0) {
+                    return Array.from(rows).map(r => r.textContent).join('\\n');
+                }
+                const terminal = document.querySelector('.xterm, .terminal, [class*="terminal"]');
+                if (terminal) {
+                    return terminal.innerText || terminal.textContent || '';
+                }
+                return '';
+            }
+        """)
+        return text or ""
+    except Exception:
+        return ""
+
+
+def _cmd_take_screenshot(page, parser, path):
+    page.screenshot(path=path)
+
+
+def _cmd_go_back(page, parser):
+    page.go_back()
+    time.sleep(1)
+    page.go_back()
+    time.sleep(2)
+
+
+# Command dispatch table
+_COMMANDS = {
+    "is_logged_in": _cmd_is_logged_in,
+    "login": _cmd_login,
+    "search_devices": _cmd_search_devices,
+    "select_device": _cmd_select_device,
+    "open_console": _cmd_open_console,
+    "check_port": _cmd_check_port,
+    "check_all_ports": _cmd_check_all_ports,
+    "take_screenshot": _cmd_take_screenshot,
+    "go_back": _cmd_go_back,
+}
+
+
+# ── Public API (called from main thread) ────────────────────────────────────
+
 class NCMAutomation:
-    """Automates Cradlepoint NCM web portal via Playwright."""
+    """Automates Cradlepoint NCM web portal via Playwright.
+
+    All Playwright operations run in a background thread to avoid
+    event loop conflicts with questionary/prompt_toolkit.
+    """
 
     def __init__(self, headless: bool = HEADLESS, timeout: int = BROWSER_TIMEOUT):
         self.headless = headless
         self.timeout = timeout
-        self._pw = None
-        self._context: BrowserContext | None = None
-        self._page: Page | None = None
-        self._parser = HostnameParser()
-        self._logged_in = False
+        self._cmd_q: queue.Queue = queue.Queue()
+        self._result_q: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._started = False
 
     def start(self):
-        """Launch browser with persistent context (preserves session cookies)."""
-        user_data_dir = str(Path.home() / ".console-check" / "browser-data")
-        Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+        """Launch browser in background thread."""
+        if self._started:
+            return
 
-        self._pw = sync_playwright().start()
-        self._context = self._pw.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=self.headless,
-            viewport={"width": 1280, "height": 800},
-            args=["--disable-blink-features=AutomationControlled"],
+        self._thread = threading.Thread(
+            target=_playwright_worker,
+            args=(self.headless, self.timeout, self._cmd_q, self._result_q),
+            daemon=True,
         )
-        self._context.set_default_timeout(self.timeout)
+        self._thread.start()
 
-        if self._context.pages:
-            self._page = self._context.pages[0]
-        else:
-            self._page = self._context.new_page()
+        # Wait for startup to complete
+        status, err = self._result_q.get(timeout=60)
+        if status == "error":
+            raise RuntimeError(f"Failed to launch browser: {err}")
+        self._started = True
 
     def close(self):
-        """Clean up browser resources."""
-        try:
-            if self._context:
-                self._context.close()
-            if self._pw:
-                self._pw.stop()
-        except Exception:
-            pass
+        """Stop the background thread and close the browser."""
+        if self._started:
+            self._cmd_q.put(_SENTINEL)
+            if self._thread:
+                self._thread.join(timeout=10)
+            self._started = False
 
-    @property
-    def page(self) -> Page:
-        if not self._page:
+    def _call(self, method: str, *args, **kwargs):
+        """Send a command to the worker thread and wait for the result."""
+        if not self._started:
             raise RuntimeError("Browser not started. Call start() first.")
-        return self._page
+        self._cmd_q.put((method, args, kwargs))
+        status, result = self._result_q.get(timeout=120)
+        if status == "error":
+            raise result
+        return result
 
-    # ── Login ───────────────────────────────────────────────────────────────
+    # ── Public methods ──────────────────────────────────────────────────────
 
     def is_logged_in(self) -> bool:
-        """Check if we're already logged into NCM (session cookie valid)."""
-        try:
-            self.page.goto(NCM_URL, wait_until="domcontentloaded")
-            time.sleep(2)
-
-            # Check if we landed on a login page or the dashboard
-            url = self.page.url.lower()
-            if "login" in url or "signin" in url or "auth" in url:
-                return False
-
-            # Try to find dashboard content
-            try:
-                self.page.wait_for_selector(SELECTORS["dashboard"], timeout=5000)
-                return True
-            except PwTimeout:
-                return False
-        except Exception:
-            return False
+        return self._call("is_logged_in")
 
     def login(self, username: str, password: str) -> bool:
-        """Log into NCM with username and password.
-
-        Returns True if login succeeded, False otherwise.
-        """
-        try:
-            self.page.goto(NCM_URL, wait_until="domcontentloaded")
-            time.sleep(2)
-
-            # Check if already logged in
-            url = self.page.url.lower()
-            if "login" not in url and "signin" not in url and "auth" not in url:
-                try:
-                    self.page.wait_for_selector(SELECTORS["dashboard"], timeout=5000)
-                    self._logged_in = True
-                    return True
-                except PwTimeout:
-                    pass
-
-            # Find and fill login form
-            username_input = self.page.locator(SELECTORS["login_username"]).first
-            username_input.click()
-            username_input.fill(username)
-
-            password_input = self.page.locator(SELECTORS["login_password"]).first
-            password_input.click()
-            password_input.fill(password)
-
-            # Submit
-            self.page.locator(SELECTORS["login_submit"]).first.click()
-
-            # Wait for navigation
-            time.sleep(3)
-            self.page.wait_for_load_state("domcontentloaded")
-
-            # Check for login error
-            try:
-                error = self.page.locator(SELECTORS["login_error"]).first
-                if error.is_visible(timeout=2000):
-                    return False
-            except Exception:
-                pass
-
-            # Verify we're logged in
-            url = self.page.url.lower()
-            if "login" in url or "signin" in url:
-                return False
-
-            self._logged_in = True
-            return True
-
-        except PwTimeout:
-            return False
-        except Exception as e:
-            raise RuntimeError(f"Login failed: {e}") from e
-
-    # ── Device Search ───────────────────────────────────────────────────────
+        return self._call("login", username, password)
 
     def search_devices(self, search_key: str) -> list[DeviceInfo]:
-        """Navigate to Devices tab and search for devices matching the key.
-
-        Args:
-            search_key: The UNLOCODE-based search key (e.g., "USDAL")
-
-        Returns:
-            List of DeviceInfo found in the device table.
-        """
-        try:
-            # Navigate to devices
-            devices_link = self.page.locator(SELECTORS["devices_nav"]).first
-            devices_link.click()
-            time.sleep(2)
-            self.page.wait_for_load_state("domcontentloaded")
-
-            # Find search/filter input
-            search_input = self.page.locator(SELECTORS["device_search"]).first
-            search_input.click()
-            search_input.fill("")
-            search_input.fill(search_key)
-            time.sleep(2)  # Wait for filter to apply
-
-            # Scrape device rows
-            return self._scrape_device_list()
-
-        except PwTimeout:
-            return []
-        except Exception as e:
-            raise RuntimeError(f"Device search failed: {e}") from e
-
-    def _scrape_device_list(self) -> list[DeviceInfo]:
-        """Extract device info from the current device list/table."""
-        devices = []
-        try:
-            rows = self.page.locator(SELECTORS["device_rows"]).all()
-            for i, row in enumerate(rows):
-                text = row.inner_text().strip()
-                if not text:
-                    continue
-
-                # Parse device name and status from row text
-                # The exact parsing depends on NCM's table structure
-                parts = text.split("\t")  # tab-separated in table cells
-                if not parts:
-                    parts = text.split("\n")
-
-                name = parts[0].strip() if parts else text[:50]
-
-                # Try to find status — look for common keywords
-                status = "unknown"
-                text_lower = text.lower()
-                if "online" in text_lower:
-                    status = "online"
-                elif "offline" in text_lower:
-                    status = "offline"
-
-                devices.append(DeviceInfo(name=name, status=status, row_index=i))
-
-        except Exception:
-            pass
-
-        return devices
-
-    # ── Device Selection & Console ──────────────────────────────────────────
+        return self._call("search_devices", search_key)
 
     def select_device(self, device: DeviceInfo):
-        """Click into a specific device from the device list."""
-        try:
-            rows = self.page.locator(SELECTORS["device_rows"]).all()
-            if device.row_index < len(rows):
-                rows[device.row_index].click()
-                time.sleep(2)
-                self.page.wait_for_load_state("domcontentloaded")
-            else:
-                raise RuntimeError(f"Device row {device.row_index} not found")
-        except PwTimeout:
-            raise RuntimeError("Timed out clicking on device")
+        return self._call("select_device", device.row_index)
 
     def open_console(self):
-        """Navigate from device detail to the console terminal.
-
-        Flow: Troubleshooting tab → Remote Connect → Console → Open Console
-        """
-        try:
-            # Click Troubleshooting tab
-            self.page.locator(SELECTORS["troubleshooting_tab"]).first.click()
-            time.sleep(2)
-
-            # Click Remote Connect
-            self.page.locator(SELECTORS["remote_connect"]).first.click()
-            time.sleep(2)
-
-            # Click Console option
-            try:
-                self.page.locator(SELECTORS["console_option"]).first.click()
-                time.sleep(1)
-            except Exception:
-                pass  # Console might already be selected
-
-            # Click Open Console button
-            self.page.locator(SELECTORS["open_console_btn"]).first.click()
-            time.sleep(3)  # Give the terminal time to initialize
-
-            # Wait for terminal widget to appear
-            self.page.wait_for_selector(SELECTORS["terminal"], timeout=15000)
-            time.sleep(2)
-
-        except PwTimeout:
-            raise RuntimeError(
-                "Timed out opening console. The device may be offline or "
-                "the NCM UI structure may have changed."
-            )
-
-    # ── Port Checking ───────────────────────────────────────────────────────
+        return self._call("open_console")
 
     def check_port(self, port_number: int) -> PortResult:
-        """Check a single console port by typing serial command and reading output.
-
-        Args:
-            port_number: Port number 1-4
-
-        Returns:
-            PortResult with extracted hostname or error.
-        """
-        if port_number not in (1, 2, 3, 4):
-            return PortResult(port=port_number, error="Invalid port number (must be 1-4)")
-
-        try:
-            # Click on terminal to ensure focus
-            terminal = self.page.locator(SELECTORS["terminal"]).first
-            terminal.click()
-            time.sleep(0.5)
-
-            # Type the serial command
-            self.page.keyboard.type(f"serial --force {port_number}")
-            self.page.keyboard.press("Enter")
-            time.sleep(3)  # Wait for serial connection
-
-            # Send a couple of Enters to wake the device
-            self.page.keyboard.press("Enter")
-            time.sleep(1)
-            self.page.keyboard.press("Enter")
-            time.sleep(2)
-
-            # Read terminal output
-            output = self._read_terminal()
-
-            if not output or not output.strip():
-                # Retry with longer wait
-                self.page.keyboard.press("Enter")
-                time.sleep(5)
-                output = self._read_terminal()
-
-            # Parse hostname
-            result = self._parser.parse(output)
-
-            return PortResult(
-                port=port_number,
-                raw_output=output,
-                hostname=result.hostname,
-                confidence=result.confidence,
-                error=None if output.strip() else "No response from port",
-            )
-
-        except PwTimeout:
-            return PortResult(port=port_number, error="Timed out reading port")
-        except Exception as e:
-            return PortResult(port=port_number, error=str(e))
+        return self._call("check_port", port_number)
 
     def check_all_ports(self) -> list[PortResult]:
-        """Check all 4 console ports sequentially."""
-        results = []
-        for port in range(1, 5):
-            result = self.check_port(port)
-            results.append(result)
-
-            # Brief pause between ports to let the terminal settle
-            if port < 4:
-                time.sleep(1)
-
-        return results
-
-    def _read_terminal(self) -> str:
-        """Scrape text content from the terminal widget.
-
-        Tries xterm.js DOM scraping first, falls back to broader approaches.
-        """
-        # Approach 1: xterm.js rows (most common terminal library)
-        try:
-            text = self.page.evaluate("""
-                () => {
-                    // Try xterm.js structure
-                    const rows = document.querySelectorAll('.xterm-rows > div');
-                    if (rows.length > 0) {
-                        return Array.from(rows).map(r => r.textContent).join('\\n');
-                    }
-
-                    // Try generic terminal container
-                    const terminal = document.querySelector('.xterm, .terminal, [class*="terminal"]');
-                    if (terminal) {
-                        return terminal.innerText || terminal.textContent || '';
-                    }
-
-                    return '';
-                }
-            """)
-            return text or ""
-        except Exception:
-            return ""
-
-    # ── Utility ─────────────────────────────────────────────────────────────
+        return self._call("check_all_ports")
 
     def take_screenshot(self, path: str = "ncm_debug.png"):
-        """Save a screenshot for debugging selector issues."""
         try:
-            self.page.screenshot(path=path)
+            self._call("take_screenshot", path)
         except Exception:
             pass
+
+    def go_back(self):
+        """Navigate back (for returning to device list)."""
+        self._call("go_back")
