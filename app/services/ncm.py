@@ -378,8 +378,93 @@ def _cmd_open_console(page, parser):
     page.locator(SELECTORS["open_console_btn"]).first.click()
     time.sleep(5)
 
-    # Console can be slow to initialize — use 360s timeout
-    page.wait_for_selector(SELECTORS["terminal"], timeout=360000)
+    # Wait for the console/terminal to appear.
+    # NCM's DOM structure may vary — try multiple detection strategies.
+    terminal_found = False
+
+    # Strategy 1: known terminal selectors
+    try:
+        page.wait_for_selector(SELECTORS["terminal"], timeout=10000)
+        terminal_found = True
+    except PwTimeout:
+        pass
+
+    if not terminal_found:
+        # Strategy 2: look for iframe (console may load in an iframe)
+        try:
+            page.wait_for_selector('iframe', timeout=5000)
+            terminal_found = True
+        except PwTimeout:
+            pass
+
+    if not terminal_found:
+        # Strategy 3: look for canvas (some terminal renderers use canvas)
+        try:
+            page.wait_for_selector('canvas', timeout=5000)
+            terminal_found = True
+        except PwTimeout:
+            pass
+
+    if not terminal_found:
+        # Strategy 4: poll for any new significant content change on the page
+        # The console is open if the page URL or content changed after clicking
+        # Wait up to 360s, checking every 5s for terminal-like content
+        for _ in range(70):  # 70 * 5s = 350s
+            time.sleep(5)
+
+            # Check all terminal-like selectors
+            for selector in [
+                SELECTORS["terminal"],
+                'iframe',
+                'canvas',
+                '[class*="console"]',
+                '[class*="Console"]',
+                '[class*="term"]',
+                '[class*="shell"]',
+                '[id*="terminal"]',
+                '[id*="console"]',
+                'pre',
+            ]:
+                try:
+                    el = page.locator(selector).first
+                    if el.is_visible(timeout=500):
+                        terminal_found = True
+                        break
+                except Exception:
+                    continue
+
+            if terminal_found:
+                break
+
+            # Also check if there's a text input / textarea that appeared (some consoles use this)
+            try:
+                has_console = page.evaluate("""() => {
+                    // Look for anything that smells like a terminal
+                    const candidates = [
+                        ...document.querySelectorAll('[class*="xterm"], [class*="terminal"], [class*="console"], [class*="Console"]'),
+                        ...document.querySelectorAll('iframe, canvas'),
+                        ...document.querySelectorAll('[role="application"], [role="textbox"]'),
+                    ];
+                    return candidates.some(el => el.offsetParent !== null || el.offsetHeight > 0);
+                }""")
+                if has_console:
+                    terminal_found = True
+                    break
+            except Exception:
+                pass
+
+    if not terminal_found:
+        # Save a debug screenshot so the user can report what the page looks like
+        try:
+            page.screenshot(path="ncm_console_debug.png")
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Could not detect the console terminal. A debug screenshot has been "
+            "saved to ncm_console_debug.png — please share it so we can update "
+            "the selectors."
+        )
+
     time.sleep(3)
 
 
@@ -432,23 +517,66 @@ def _cmd_check_all_ports(page, parser):
 
 
 def _read_terminal(page) -> str:
+    """Scrape text content from the terminal, trying multiple approaches."""
+    # Approach 1: xterm.js rows (most common)
     try:
         text = page.evaluate("""
             () => {
+                // xterm.js rows
                 const rows = document.querySelectorAll('.xterm-rows > div');
                 if (rows.length > 0) {
                     return Array.from(rows).map(r => r.textContent).join('\\n');
                 }
-                const terminal = document.querySelector('.xterm, .terminal, [class*="terminal"]');
-                if (terminal) {
-                    return terminal.innerText || terminal.textContent || '';
+
+                // Generic terminal container
+                const selectors = [
+                    '.xterm', '.terminal', '[class*="terminal"]',
+                    '[class*="console"]', '[class*="Console"]',
+                    '[class*="term"]', 'pre',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && (el.innerText || el.textContent)) {
+                        return el.innerText || el.textContent || '';
+                    }
                 }
+
+                // Role-based
+                const app = document.querySelector('[role="application"], [role="textbox"]');
+                if (app) return app.innerText || app.textContent || '';
+
                 return '';
             }
         """)
-        return text or ""
+        if text and text.strip():
+            return text
     except Exception:
-        return ""
+        pass
+
+    # Approach 2: check inside iframes
+    try:
+        frames = page.frames
+        for frame in frames:
+            if frame == page.main_frame:
+                continue
+            try:
+                text = frame.evaluate("""
+                    () => {
+                        const rows = document.querySelectorAll('.xterm-rows > div');
+                        if (rows.length > 0) {
+                            return Array.from(rows).map(r => r.textContent).join('\\n');
+                        }
+                        return document.body ? (document.body.innerText || document.body.textContent || '') : '';
+                    }
+                """)
+                if text and text.strip():
+                    return text
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return ""
 
 
 def _cmd_take_screenshot(page, parser, path):
