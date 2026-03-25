@@ -312,8 +312,23 @@ def _cmd_search_devices(page, parser, search_key):
 
 
 def _scrape_device_list(page) -> list[DeviceInfo]:
+    """Scrape all devices, scrolling to load any that are below the fold."""
     devices = []
     try:
+        # Scroll down repeatedly to load all devices (NCM may lazy-load or paginate)
+        prev_count = 0
+        for _ in range(20):  # max 20 scroll attempts
+            rows = page.locator(SELECTORS["device_rows"]).all()
+            current_count = len(rows)
+            if current_count == prev_count:
+                break  # no new rows loaded, we have them all
+            prev_count = current_count
+            # Scroll the last row into view to trigger loading more
+            if rows:
+                rows[-1].scroll_into_view_if_needed()
+                time.sleep(1)
+
+        # Now scrape all rows
         rows = page.locator(SELECTORS["device_rows"]).all()
         for i, row in enumerate(rows):
             text = row.inner_text().strip()
@@ -361,10 +376,11 @@ def _cmd_open_console(page, parser):
         pass
 
     page.locator(SELECTORS["open_console_btn"]).first.click()
-    time.sleep(3)
+    time.sleep(5)
 
-    page.wait_for_selector(SELECTORS["terminal"], timeout=15000)
-    time.sleep(2)
+    # Console can be slow to initialize — use 60s timeout (double the default)
+    page.wait_for_selector(SELECTORS["terminal"], timeout=60000)
+    time.sleep(3)
 
 
 def _cmd_check_port(page, parser, port_number):
