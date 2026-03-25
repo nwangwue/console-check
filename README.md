@@ -1,8 +1,6 @@
 # console-check
 
-CLI tool for verifying Cisco device readiness on Cradlepoint E100 console ports before SDWAN migration cutovers.
-
-Engineers use this tool to import a master site list, look up customers by name to find their Cradlepoint search key, paste console output from NCM, and track port verification status across 300+ sites.
+CLI tool that automates Cradlepoint console port verification for SDWAN migration cutovers. Enter a city and state, and the tool resolves the UNLOCODE, opens NCM in a browser, finds the matching Cradlepoints, and checks all 4 console ports automatically.
 
 ## Quick Start
 
@@ -15,6 +13,9 @@ $env:UV_PROJECT_ENVIRONMENT = "C:\Users\$env:USERNAME\.venvs\console-check"
 
 # Install dependencies
 python -m uv sync
+
+# Install browser for automation (one-time)
+python -m uv run playwright install chromium
 
 # Run the tool
 python -m uv run console-check
@@ -32,55 +33,47 @@ $env:UV_PROJECT_ENVIRONMENT = "C:\Users\$env:USERNAME\.venvs\console-check"
 
 ## What It Does
 
-1. **Import** a master site list spreadsheet (xlsx/csv) with interactive column mapping
-2. **Search** by customer/bank name, city, site ID, or UNLOCODE to find sites and their CP search key
-3. **Verify** console ports — paste Cisco IOS-XE output, tool extracts the hostname and compares against expected devices
-4. **Detect swaps** — if a hostname appears on the wrong port, the tool identifies the swap and lets you accept it
-5. **Track readiness** — dashboard shows ready/issues/partial/not checked counts across all sites
-6. **Export** CSV readiness reports for stakeholders
+1. **Enter city + state** (e.g., "Dallas", "TX")
+2. **Resolve UNLOCODE** — tool finds the 3-character location code (e.g., `DAL`)
+3. **Open NCM** — browser launches, logs in, searches for Cradlepoints matching `USDAL`
+4. **Pick a device** — tool shows matching devices, engineer selects one
+5. **Check all 4 ports** — tool runs `serial --force 1` through `serial --force 4`
+6. **Display results** — hostname found on each port displayed in a table
 
 ## Workflow
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌───────────┐
-│ Import xlsx  │────>│ Search site  │────>│ Verify ports │────>│ Dashboard │
-│ (one-time)   │     │ by customer  │     │ paste output │     │ + Export  │
-└─────────────┘     └──────────────┘     └──────────────┘     └───────────┘
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Enter city   │────>│ Resolve      │────>│ Search NCM   │────>│ Check all 4  │
+│ + state      │     │ UNLOCODE     │     │ pick device  │     │ console ports│
+└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
 ### Typical Use During a Cutover
 
-1. Search for the customer name (e.g., "First National Bank")
-2. Copy the **CP Search Key** (e.g., `USDAL`) displayed in the tool
-3. Paste it into NCM to find the Cradlepoint
-4. For each console port, copy the output from NCM and paste it into the tool
-5. Tool extracts the hostname and tells you: match, mismatch, or swapped
-6. Move to the next site
+1. Run `console-check`
+2. Enter the site's city and state
+3. Tool resolves the UNLOCODE and shows the CP search key
+4. Browser opens NCM automatically — log in if prompted
+5. Tool searches for matching Cradlepoints and lists them
+6. Pick the right device from the list
+7. Tool connects to console and checks all 4 serial ports
+8. See which hostname is on each port — done!
 
 ## Project Structure
 
 ```
 console-check/
 ├── app/
-│   ├── cli.py              # Main interactive CLI (entry point)
-│   ├── cli_helpers.py       # Rich terminal rendering (tables, panels)
-│   ├── config.py            # Configuration (DB path, CSV path)
-│   ├── database.py          # SQLAlchemy engine + session
-│   ├── models/              # SQLAlchemy models
-│   │   ├── site.py          #   Site (id, city, state, bank_name, unlocode, status)
-│   │   ├── device.py        #   Device (expected hostname per port)
-│   │   └── verification.py  #   Verification (audit trail of checks)
-│   ├── schemas/             # Pydantic data models
-│   │   ├── import_config.py #   Column mapping + import results
-│   │   └── verification.py  #   Verify result model
-│   └── services/            # Business logic
-│       ├── unlocode.py      #   City+State → UNLOCODE resolution
-│       ├── hostname_parser.py#  Extract hostname from Cisco console output
-│       ├── verifier.py      #   Port verification + swap detection
-│       ├── importer.py      #   Spreadsheet import + column mapping
-│       └── exporter.py      #   CSV readiness report export
+│   ├── cli.py               # Main interactive CLI (entry point)
+│   ├── cli_helpers.py        # Rich terminal rendering (tables, panels)
+│   ├── config.py             # Configuration (NCM URL, Playwright settings)
+│   └── services/
+│       ├── unlocode.py       #   City+State → UNLOCODE resolution
+│       ├── hostname_parser.py#   Extract hostname from Cisco console output
+│       └── ncm.py            #   Playwright browser automation for NCM
 ├── data/
-│   └── us_locode.csv        # ~21K US UN/LOCODE entries
+│   └── us_locode.csv         # ~21K US UN/LOCODE entries
 ├── tests/
 │   ├── test_hostname_parser.py
 │   └── test_unlocode.py
@@ -94,7 +87,7 @@ Automatically resolves city + state to a 3-character UN/LOCODE using a 3-tier st
 - **Exact match** — "Dallas" + "TX" → `DAL`
 - **Normalized match** — "St. Louis" → "Saint Louis" → `STL`
 - **Fuzzy match** — "Springfild" → "Springfield" (≥85% similarity)
-- Falls back to manual resolution with suggestions if no match found
+- Falls back to suggestions or manual entry if no match found
 
 ### Hostname Parser
 Extracts Cisco IOS-XE hostnames from raw console output including:
@@ -105,8 +98,12 @@ Extracts Cisco IOS-XE hostnames from raw console output including:
 - Post-TACACS-rejection prompts
 - Strips ANSI escape codes automatically
 
-### Swap Detection
-If you paste console output for Port 3 and the hostname matches what's expected on Port 1, the tool detects this as a cable swap and offers to accept it — updating the expected port assignments without requiring re-cabling.
+### NCM Browser Automation
+- Uses Playwright to automate the Cradlepoint NCM web portal
+- Persistent browser context — session cookies survive between runs, so you don't re-login every time
+- Navigates: Devices → filter → select device → Troubleshooting → Remote Connect → Console
+- Runs `serial --force [1-4]` to check each port
+- Extracts terminal output via DOM scraping (xterm.js)
 
 ## Configuration
 
@@ -114,14 +111,17 @@ Environment variables (all optional):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_PATH` | `console_check.db` | SQLite database file path |
+| `NCM_URL` | `https://www.cradlepointecm.com` | NCM instance URL |
 | `LOCODE_CSV_PATH` | `data/us_locode.csv` | Path to US UNLOCODE dataset |
 | `FUZZY_MATCH_THRESHOLD` | `85` | Minimum fuzzy match score (0-100) |
-| `CONSOLE_CHECK_ENGINEER` | _(empty)_ | Pre-fill engineer name on startup |
+| `CONSOLE_CHECK_HEADLESS` | `false` | Run browser headless (no visible window) |
+| `CONSOLE_CHECK_TIMEOUT` | `30000` | Browser operation timeout in milliseconds |
+
+**Note:** NCM credentials are always prompted interactively and never stored in environment variables or files.
 
 ## Development
 
-```bash
+```powershell
 # Install with dev dependencies
 python -m uv sync --extra dev
 
@@ -132,12 +132,22 @@ python -m uv run pytest -v
 python -m uv run console-check
 ```
 
+## Troubleshooting
+
+### NCM selectors not working
+If NCM updates their UI, the CSS selectors in `app/services/ncm.py` may need updating. The tool saves a debug screenshot (`ncm_debug.png`) when navigation fails. Open NCM in Chrome DevTools to find the new selectors and update the `SELECTORS` dict at the top of `ncm.py`.
+
+### Browser won't launch
+Run `python -m uv run playwright install chromium` to re-install the browser binaries. They're stored in `%USERPROFILE%\AppData\Local\ms-playwright`.
+
+### OneDrive .venv issues
+See the Quick Start section — the venv must be outside the OneDrive-synced folder.
+
 ## Tech Stack
 
 - **Python 3.11+**
-- **SQLAlchemy** + SQLite for persistence
+- **Playwright** for NCM browser automation
 - **Rich** for terminal UI (tables, panels, colors)
 - **Questionary** for interactive prompts
 - **rapidfuzz** for fuzzy city name matching
-- **openpyxl** for Excel file reading
 - **Pydantic** for data validation
