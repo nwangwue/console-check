@@ -1,15 +1,14 @@
 [project]
 name = "console-check"
-version = "2.0.0"
-description = "CLI tool for verifying Cisco device readiness on Cradlepoint console ports before SDWAN migration cutovers"
+version = "3.0.0"
+description = "CLI tool for automated Cradlepoint console port verification via NCM browser automation"
 requires-python = ">=3.11"
 dependencies = [
-    "sqlalchemy>=2.0.25",
     "pydantic>=2.5.3",
-    "openpyxl>=3.1.2",
     "rapidfuzz>=3.6.1",
     "rich>=13.0",
     "questionary>=2.0",
+    "playwright>=1.40",
 ]
 
 [project.scripts]
