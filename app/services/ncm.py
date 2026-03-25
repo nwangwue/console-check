@@ -302,7 +302,9 @@ def _cmd_search_devices(page, parser, search_key):
         search_input.click()
         search_input.fill("")
         search_input.fill(search_key)
-        time.sleep(2)
+        page.keyboard.press("Enter")
+        time.sleep(3)
+        page.wait_for_load_state("domcontentloaded")
 
         return _scrape_device_list(page)
     except PwTimeout:
