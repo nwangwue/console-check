@@ -108,7 +108,7 @@ def _playwright_worker(
             method_name, args, kwargs = cmd
             try:
                 fn = _COMMANDS[method_name]
-                ret = fn(page=page, parser=parser, *args, **kwargs)
+                ret = fn(page, parser, *args, **kwargs)
                 result_queue.put(("ok", ret))
             except Exception as e:
                 result_queue.put(("error", e))
