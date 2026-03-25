@@ -378,8 +378,8 @@ def _cmd_open_console(page, parser):
     page.locator(SELECTORS["open_console_btn"]).first.click()
     time.sleep(5)
 
-    # Console can be slow to initialize — use 60s timeout (double the default)
-    page.wait_for_selector(SELECTORS["terminal"], timeout=60000)
+    # Console can be slow to initialize — use 360s timeout
+    page.wait_for_selector(SELECTORS["terminal"], timeout=360000)
     time.sleep(3)
 
 
