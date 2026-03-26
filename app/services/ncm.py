@@ -64,8 +64,11 @@ SELECTORS = {
     "console_option": 'a:has-text("Console"), button:has-text("Console"), [data-type="console"]',
     "open_console_btn": 'button:has-text("Open Console"), button:has-text("Connect"), a:has-text("Open Console")',
 
-    # Terminal
-    "terminal": '.xterm, .terminal, [class*="terminal"], .xterm-screen',
+    # Terminal — NCM console is an Ember.js app, NOT xterm.js.
+    # The console area is typically a div/pre with black background containing the bash prompt.
+    # The "Close Console" button appearing means the console IS open.
+    "close_console_btn": 'button:has-text("Close Console"), a:has-text("Close Console"), :has-text("Close Console")',
+    "terminal": '.xterm, .terminal, [class*="terminal"], .xterm-screen, [class*="console-output"], [class*="console-terminal"], [class*="ember-view"][style*="background"], pre[style*="background"]',
     "terminal_rows": '.xterm-rows > div, .xterm-rows .xterm-row',
 }
 
@@ -380,6 +383,7 @@ def _cmd_select_device(page, parser, row_index):
 
 def _cmd_open_console(page, parser):
     from playwright.sync_api import TimeoutError as PwTimeout
+
     page.locator(SELECTORS["troubleshooting_tab"]).first.click()
     time.sleep(2)
 
@@ -393,29 +397,60 @@ def _cmd_open_console(page, parser):
         pass
 
     page.locator(SELECTORS["open_console_btn"]).first.click()
-    time.sleep(5)
 
-    # Quick check for known terminal selectors
-    terminal_selectors = [
-        SELECTORS["terminal"],
-        'iframe', 'canvas',
-        '[class*="console"]', '[class*="Console"]',
-        '[class*="term"]', '[class*="shell"]',
-        '[id*="terminal"]', '[id*="console"]',
-        '[role="application"]', 'pre',
-    ]
+    # Wait for console to initialize — NCM can be slow here
+    # Poll for up to 360 seconds using multiple detection strategies
+    for attempt in range(72):  # 72 * 5s = 360s
+        time.sleep(5)
 
-    for selector in terminal_selectors:
+        # Strategy 1: URL contains "console" — we're on the right page
+        url = page.url.lower()
+        url_has_console = "console" in url and "troubleshoot" in url
+
+        # Strategy 2: "Close Console" button is visible (means console IS open)
+        close_btn_visible = False
         try:
-            el = page.locator(selector).first
-            if el.is_visible(timeout=2000):
-                time.sleep(2)
-                return "auto_detected"
+            close_btn = page.locator(SELECTORS["close_console_btn"]).first
+            close_btn_visible = close_btn.is_visible(timeout=1000)
         except Exception:
+            pass
+
+        # Strategy 3: Page contains a bash/shell prompt pattern ($ or #)
+        has_prompt = False
+        try:
+            has_prompt = page.evaluate("""() => {
+                const body = document.body.innerText || '';
+                // Look for shell prompt patterns: user@host, ]$, ]#, etc.
+                return /[@].*[$#]\\s*$|\\]\\$\\s*$/m.test(body);
+            }""")
+        except Exception:
+            pass
+
+        # Strategy 4: Any known terminal-like DOM element
+        terminal_visible = False
+        for selector in [
+            SELECTORS["terminal"],
+            'iframe', 'canvas',
+            '[class*="console-output"]', '[class*="console-terminal"]',
+        ]:
+            try:
+                el = page.locator(selector).first
+                if el.is_visible(timeout=500):
+                    terminal_visible = True
+                    break
+            except Exception:
+                continue
+
+        # If ANY strong signal detected, console is ready
+        if close_btn_visible or has_prompt or terminal_visible:
+            time.sleep(2)  # Brief settle
+            return "auto_detected"
+
+        # URL is right but console not ready yet — keep waiting
+        if url_has_console and attempt < 71:
             continue
 
-    # Could not auto-detect — return so the CLI can ask the user
-    # Save a debug screenshot to an absolute path
+    # Timeout — could not detect console
     debug_path = str(Path.home() / ".console-check" / "ncm_console_debug.png")
     try:
         Path(debug_path).parent.mkdir(parents=True, exist_ok=True)
@@ -437,22 +472,26 @@ def _cmd_check_port(page, parser, port_number):
         return PortResult(port=port_number, error="Invalid port number (must be 1-4)")
 
     try:
-        terminal = page.locator(SELECTORS["terminal"]).first
-        terminal.click()
-        time.sleep(0.5)
+        # Click somewhere on the page to ensure focus is on the console area.
+        # Try clicking the terminal/console area, or just the body.
+        _focus_terminal(page)
 
+        # Type the serial command
         page.keyboard.type(f"serial --force {port_number}")
+        page.keyboard.press("Enter")
+        time.sleep(5)  # Serial connection takes a moment
+
+        # Send Enters to wake the device
+        page.keyboard.press("Enter")
+        time.sleep(2)
         page.keyboard.press("Enter")
         time.sleep(3)
 
-        page.keyboard.press("Enter")
-        time.sleep(1)
-        page.keyboard.press("Enter")
-        time.sleep(2)
-
+        # Read terminal output
         output = _read_terminal(page)
 
         if not output or not output.strip():
+            # Retry with longer wait
             page.keyboard.press("Enter")
             time.sleep(5)
             output = _read_terminal(page)
@@ -470,6 +509,47 @@ def _cmd_check_port(page, parser, port_number):
         return PortResult(port=port_number, error=str(e))
 
 
+def _focus_terminal(page):
+    """Click on the terminal/console area to ensure keyboard focus."""
+    # Try known terminal selectors first
+    for selector in [
+        SELECTORS["terminal"],
+        '[class*="console-output"]',
+        '[class*="console-terminal"]',
+    ]:
+        try:
+            el = page.locator(selector).first
+            if el.is_visible(timeout=1000):
+                el.click()
+                time.sleep(0.3)
+                return
+        except Exception:
+            continue
+
+    # Fallback: use JS to find the element with dark background (the terminal)
+    try:
+        page.evaluate("""() => {
+            // Find elements with dark background that look like a terminal
+            const allEls = document.querySelectorAll('div, pre, textarea');
+            for (const el of allEls) {
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                // Check for black or very dark backgrounds
+                if (bg === 'rgb(0, 0, 0)' || bg === '#000' || bg === '#000000' ||
+                    bg === 'rgb(30, 30, 30)' || bg === 'rgb(33, 33, 33)') {
+                    if (el.offsetHeight > 50 && el.offsetWidth > 100) {
+                        el.click();
+                        el.focus();
+                        return;
+                    }
+                }
+            }
+        }""")
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+
 def _cmd_check_all_ports(page, parser):
     results = []
     for port in range(1, 5):
@@ -481,37 +561,75 @@ def _cmd_check_all_ports(page, parser):
 
 
 def _read_terminal(page) -> str:
-    """Scrape text content from the terminal, trying multiple approaches."""
-    # Approach 1: xterm.js rows (most common)
-    try:
-        text = page.evaluate("""
-            () => {
-                // xterm.js rows
-                const rows = document.querySelectorAll('.xterm-rows > div');
-                if (rows.length > 0) {
-                    return Array.from(rows).map(r => r.textContent).join('\\n');
-                }
+    """Scrape text content from the NCM console terminal.
 
-                // Generic terminal container
-                const selectors = [
-                    '.xterm', '.terminal', '[class*="terminal"]',
-                    '[class*="console"]', '[class*="Console"]',
-                    '[class*="term"]', 'pre',
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el && (el.innerText || el.textContent)) {
-                        return el.innerText || el.textContent || '';
+    NCM's console is an Ember.js app — NOT xterm.js. The terminal is typically
+    a div/pre with a black background. We try multiple approaches to find it.
+    """
+    try:
+        text = page.evaluate("""() => {
+            // Strategy 1: xterm.js rows (in case NCM ever uses it)
+            const xtermRows = document.querySelectorAll('.xterm-rows > div');
+            if (xtermRows.length > 0) {
+                return Array.from(xtermRows).map(r => r.textContent).join('\\n');
+            }
+
+            // Strategy 2: Find elements with dark backgrounds (the terminal area)
+            const allEls = document.querySelectorAll('div, pre, textarea, span');
+            let bestTerminal = null;
+            let bestArea = 0;
+            for (const el of allEls) {
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                // Check for black/very dark backgrounds
+                const isBlack = bg === 'rgb(0, 0, 0)' || bg === '#000' || bg === '#000000'
+                    || bg === 'rgb(30, 30, 30)' || bg === 'rgb(33, 33, 33)';
+                if (isBlack && el.offsetHeight > 30 && el.offsetWidth > 100) {
+                    const area = el.offsetHeight * el.offsetWidth;
+                    if (area > bestArea) {
+                        bestArea = area;
+                        bestTerminal = el;
                     }
                 }
-
-                // Role-based
-                const app = document.querySelector('[role="application"], [role="textbox"]');
-                if (app) return app.innerText || app.textContent || '';
-
-                return '';
             }
-        """)
+            if (bestTerminal) {
+                return bestTerminal.innerText || bestTerminal.textContent || '';
+            }
+
+            // Strategy 3: Named selectors
+            const selectors = [
+                '[class*="console-output"]', '[class*="console-terminal"]',
+                '[class*="terminal"]', '[class*="console"]',
+                '.xterm', '.terminal', 'pre',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetHeight > 30) {
+                    const text = el.innerText || el.textContent || '';
+                    if (text.trim()) return text;
+                }
+            }
+
+            // Strategy 4: Look for any element containing a shell prompt
+            const body = document.body.innerText || '';
+            const lines = body.split('\\n');
+            // Find the section that looks like terminal output (contains $ or # prompts)
+            let terminalLines = [];
+            let inTerminal = false;
+            for (const line of lines) {
+                if (/[@].*[\\$#]\\s*$/.test(line) || /^[A-Za-z].*[#>]\\s*$/.test(line)) {
+                    inTerminal = true;
+                }
+                if (inTerminal) {
+                    terminalLines.push(line);
+                }
+            }
+            if (terminalLines.length > 0) {
+                return terminalLines.join('\\n');
+            }
+
+            return '';
+        }""")
         if text and text.strip():
             return text
     except Exception:
@@ -524,15 +642,9 @@ def _read_terminal(page) -> str:
             if frame == page.main_frame:
                 continue
             try:
-                text = frame.evaluate("""
-                    () => {
-                        const rows = document.querySelectorAll('.xterm-rows > div');
-                        if (rows.length > 0) {
-                            return Array.from(rows).map(r => r.textContent).join('\\n');
-                        }
-                        return document.body ? (document.body.innerText || document.body.textContent || '') : '';
-                    }
-                """)
+                text = frame.evaluate("""() => {
+                    return document.body ? (document.body.innerText || document.body.textContent || '') : '';
+                }""")
                 if text and text.strip():
                     return text
             except Exception:
