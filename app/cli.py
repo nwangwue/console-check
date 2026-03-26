@@ -252,15 +252,25 @@ def _ensure_ncm_login():
 
     if result == "mfa_required":
         console.print("[yellow]MFA verification required[/yellow]")
-        mfa_code = questionary.text("Enter MFA token:").ask()
-        if not mfa_code:
-            raise RuntimeError("MFA token required")
+        console.print("[dim]Tip: Have your authenticator app ready — tokens expire in ~30 seconds[/dim]")
 
-        render_status("Submitting MFA token...")
-        mfa_success = ncm.submit_mfa(mfa_code.strip())
+        for attempt in range(3):
+            mfa_code = questionary.text(
+                "Enter MFA token:" if attempt == 0 else "Enter a fresh MFA token:"
+            ).ask()
+            if not mfa_code:
+                raise RuntimeError("MFA token required")
 
-        if not mfa_success:
-            raise RuntimeError("MFA verification failed. Check your token and try again.")
+            render_status("Submitting MFA token...")
+            mfa_success = ncm.submit_mfa(mfa_code.strip())
+
+            if mfa_success:
+                break
+
+            if attempt < 2:
+                console.print("[yellow]MFA failed — token may have expired. Try again with a fresh code.[/yellow]")
+            else:
+                raise RuntimeError("MFA verification failed after 3 attempts.")
 
     elif not result:
         raise RuntimeError("NCM login failed. Check your credentials and try again.")

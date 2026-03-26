@@ -267,27 +267,44 @@ def _cmd_submit_mfa(page, parser, code):
 
     # Submit
     page.locator(SELECTORS["mfa_submit"]).first.click()
-    time.sleep(3)
-    page.wait_for_load_state("domcontentloaded")
 
-    # Check for errors
+    # Wait longer — NCM can be slow to process MFA and redirect
+    time.sleep(5)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+
+    # Give the page a moment to settle after navigation
+    time.sleep(2)
+
+    # Check URL first — if we've navigated away from login/mfa, we're in
+    url = page.url.lower()
+    on_login_page = any(kw in url for kw in ("login", "signin", "auth", "mfa", "verify", "2fa", "challenge"))
+
+    if not on_login_page:
+        # We navigated away from auth pages — success
+        return True
+
+    # Check for explicit error messages
     try:
         error = page.locator(SELECTORS["login_error"]).first
-        if error.is_visible(timeout=2000):
+        if error.is_visible(timeout=1000):
             return False
     except Exception:
         pass
 
-    # Still on MFA page? Failed.
-    if _is_mfa_page(page):
-        return False
-
-    # Still on login page? Failed.
+    # If URL still looks like auth but no error — give it more time
+    # (some sites do a client-side redirect after MFA)
+    time.sleep(3)
     url = page.url.lower()
-    if "login" in url or "signin" in url:
-        return False
+    on_login_page = any(kw in url for kw in ("login", "signin", "auth", "mfa", "verify", "2fa", "challenge"))
 
-    return True
+    if not on_login_page:
+        return True
+
+    # Still on auth page — likely failed
+    return False
 
 
 def _cmd_search_devices(page, parser, search_key):
