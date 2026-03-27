@@ -1,11 +1,12 @@
 """console-check CLI — stateless Cradlepoint console port verification tool."""
 
+import argparse
 import sys
 
 import questionary
 from rich.console import Console
 
-from app.config import LOCODE_CSV_PATH
+from app.config import LOCODE_CSV_PATH, NCM_USERNAME, NCM_PASSWORD
 from app.services.unlocode import UnlocodeService
 from app.services.ncm import NCMAutomation
 from app.cli_helpers import (
@@ -21,11 +22,25 @@ from app.cli_helpers import (
 # Globals initialized in main()
 unlocode_service: UnlocodeService = None
 ncm: NCMAutomation = None
+use_env_login: bool = False
 
 
 def main():
     """Entry point for the console-check CLI."""
-    global unlocode_service, ncm
+    global unlocode_service, ncm, use_env_login
+
+    parser = argparse.ArgumentParser(description="Cradlepoint console port verification tool")
+    parser.add_argument(
+        "--env-login",
+        action="store_true",
+        help="Use NCM_USERNAME and NCM_PASSWORD environment variables instead of prompting",
+    )
+    args = parser.parse_args()
+    use_env_login = args.env_login
+
+    if use_env_login and (not NCM_USERNAME or not NCM_PASSWORD):
+        console.print("[red]--env-login requires NCM_USERNAME and NCM_PASSWORD environment variables[/red]")
+        sys.exit(1)
 
     # Load UNLOCODE data
     try:
@@ -236,16 +251,20 @@ def _ensure_ncm_login():
         render_status("Already logged into NCM ✓", style="green")
         return
 
-    # Prompt for credentials
-    console.print()
-    console.print("[bold]NCM login required[/bold]")
-    username = questionary.text("NCM Username:").ask()
-    if not username:
-        raise RuntimeError("Username required")
+    # Get credentials from env vars or prompt
+    if use_env_login:
+        username = NCM_USERNAME
+        password = NCM_PASSWORD
+    else:
+        console.print()
+        console.print("[bold]NCM login required[/bold]")
+        username = questionary.text("NCM Username:").ask()
+        if not username:
+            raise RuntimeError("Username required")
 
-    password = questionary.password("NCM Password:").ask()
-    if not password:
-        raise RuntimeError("Password required")
+        password = questionary.password("NCM Password:").ask()
+        if not password:
+            raise RuntimeError("Password required")
 
     render_status("Logging in...")
     result = ncm.login(username, password)
