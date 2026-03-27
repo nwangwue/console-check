@@ -487,16 +487,23 @@ def _cmd_check_port(page, parser, port_number):
         page.keyboard.press("Enter")
         time.sleep(3)
 
-        # Read terminal output
-        output = _read_terminal(page)
-
-        if not output or not output.strip():
-            # Retry with longer wait
-            page.keyboard.press("Enter")
-            time.sleep(5)
+        # Retry loop: read output and try to parse a hostname.
+        # The serial connection may take a while to fully establish —
+        # keep sending Enters and re-reading until we find a hostname
+        # or exhaust our retry budget.
+        output = ""
+        result = parser.parse("")
+        for retry in range(5):
             output = _read_terminal(page)
 
-        result = parser.parse(output)
+            if output and output.strip():
+                result = parser.parse(output)
+                if result.hostname:
+                    break  # Found a hostname, we're done
+
+            # No hostname yet — send Enter to nudge the device and wait
+            page.keyboard.press("Enter")
+            time.sleep(3 if retry < 2 else 5)
 
         return PortResult(
             port=port_number,
