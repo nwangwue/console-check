@@ -9,6 +9,7 @@ dependencies = [
     "rich>=13.0",
     "questionary>=2.0",
     "playwright>=1.40",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]

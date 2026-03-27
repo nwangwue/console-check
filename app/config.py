@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 LOCODE_CSV_PATH = os.getenv("LOCODE_CSV_PATH", "data/us_locode.csv")
 FUZZY_MATCH_THRESHOLD = int(os.getenv("FUZZY_MATCH_THRESHOLD", "85"))
