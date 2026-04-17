@@ -382,9 +382,56 @@ def _cmd_select_device(page, parser, row_index):
         raise RuntimeError(f"Device row {row_index} not found")
 
 
-def _cmd_open_console(page, parser):
-    from playwright.sync_api import TimeoutError as PwTimeout
+def _wait_for_console_ready(page, timeout_seconds: int) -> bool:
+    """Poll for up to `timeout_seconds` seconds for the console to be ready.
 
+    Returns True the moment any of these signals fire:
+      - "Close Console" button visible (strongest signal — console is open)
+      - Shell prompt pattern found in body text
+      - Any terminal-like DOM element is visible
+    Returns False if timeout is hit without detecting readiness.
+    """
+    iterations = max(1, timeout_seconds // 5)
+    for _ in range(iterations):
+        time.sleep(5)
+
+        # Close Console button → console is open
+        try:
+            if page.locator(SELECTORS["close_console_btn"]).first.is_visible(timeout=1000):
+                time.sleep(2)  # brief settle
+                return True
+        except Exception:
+            pass
+
+        # Shell prompt in body
+        try:
+            has_prompt = page.evaluate("""() => {
+                const body = document.body.innerText || '';
+                return /[@].*[$#]\\s*$|\\]\\$\\s*$/m.test(body);
+            }""")
+            if has_prompt:
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+        # Terminal DOM
+        for selector in [
+            SELECTORS["terminal"],
+            "iframe", "canvas",
+            "[class*='console-output']", "[class*='console-terminal']",
+        ]:
+            try:
+                if page.locator(selector).first.is_visible(timeout=500):
+                    time.sleep(2)
+                    return True
+            except Exception:
+                continue
+
+    return False
+
+
+def _cmd_open_console(page, parser):
     page.locator(SELECTORS["troubleshooting_tab"]).first.click()
     time.sleep(2)
 
@@ -399,57 +446,8 @@ def _cmd_open_console(page, parser):
 
     page.locator(SELECTORS["open_console_btn"]).first.click()
 
-    # Wait for console to initialize — NCM can be slow here
-    # Poll for up to 360 seconds using multiple detection strategies
-    for attempt in range(72):  # 72 * 5s = 360s
-        time.sleep(5)
-
-        # Strategy 1: URL contains "console" — we're on the right page
-        url = page.url.lower()
-        url_has_console = "console" in url and "troubleshoot" in url
-
-        # Strategy 2: "Close Console" button is visible (means console IS open)
-        close_btn_visible = False
-        try:
-            close_btn = page.locator(SELECTORS["close_console_btn"]).first
-            close_btn_visible = close_btn.is_visible(timeout=1000)
-        except Exception:
-            pass
-
-        # Strategy 3: Page contains a bash/shell prompt pattern ($ or #)
-        has_prompt = False
-        try:
-            has_prompt = page.evaluate("""() => {
-                const body = document.body.innerText || '';
-                // Look for shell prompt patterns: user@host, ]$, ]#, etc.
-                return /[@].*[$#]\\s*$|\\]\\$\\s*$/m.test(body);
-            }""")
-        except Exception:
-            pass
-
-        # Strategy 4: Any known terminal-like DOM element
-        terminal_visible = False
-        for selector in [
-            SELECTORS["terminal"],
-            'iframe', 'canvas',
-            '[class*="console-output"]', '[class*="console-terminal"]',
-        ]:
-            try:
-                el = page.locator(selector).first
-                if el.is_visible(timeout=500):
-                    terminal_visible = True
-                    break
-            except Exception:
-                continue
-
-        # If ANY strong signal detected, console is ready
-        if close_btn_visible or has_prompt or terminal_visible:
-            time.sleep(2)  # Brief settle
-            return "auto_detected"
-
-        # URL is right but console not ready yet — keep waiting
-        if url_has_console and attempt < 71:
-            continue
+    if _wait_for_console_ready(page, timeout_seconds=360):
+        return "auto_detected"
 
     # Timeout — could not detect console
     debug_path = str(Path.home() / ".console-check" / "ncm_console_debug.png")
@@ -460,6 +458,29 @@ def _cmd_open_console(page, parser):
         debug_path = None
 
     return {"status": "manual_confirm_needed", "screenshot": debug_path}
+
+
+def _close_and_reopen_console(page, timeout_seconds: int = 180) -> bool:
+    """Click "Close Console", wait 2s, click "Open Console", wait up to
+    `timeout_seconds` for the console to come back up.  Returns True on
+    success.  Used between ports — Cradlepoint doesn't cleanly switch
+    sessions with ~. or --force, so a full close/reopen cycle is the
+    reliable way to move to the next port.
+    """
+    try:
+        page.locator(SELECTORS["close_console_btn"]).first.click()
+    except Exception:
+        # Can't find Close Console — maybe the console is already closed.
+        # Try to push on and reopen anyway.
+        pass
+    time.sleep(2)
+
+    try:
+        page.locator(SELECTORS["open_console_btn"]).first.click()
+    except Exception as e:
+        raise RuntimeError(f"Could not click Open Console after close: {e}")
+
+    return _wait_for_console_ready(page, timeout_seconds=timeout_seconds)
 
 
 def _cmd_wait_for_user(page, parser):
@@ -573,40 +594,58 @@ def _wait_for_prompt(page, timeout: float = 10.0) -> bool:
 
 
 def _ping_terminal(page, timeout: float = 6.0) -> bool:
-    """Nudge the terminal with a bare Enter and wait for a prompt to echo back.
+    """Nudge the terminal with a bare Enter and confirm it responded.
 
-    This is the responsiveness check: if we can't get a prompt to appear after
-    pressing Enter, the terminal is stuck and subsequent commands would be
-    swallowed silently.
+    Two independent signals count as "responsive":
+      1. Output grew (new bytes appeared after pressing Enter) — most reliable
+      2. Last non-empty line ends with $, #, or > (prompt regex)
+
+    Growth is the primary signal because it doesn't depend on any assumption
+    about prompt format.  A bash prompt echo, a cursor move, or any terminal
+    update will grow the output.
     """
+    before = _read_terminal(page) or ""
+    before_len = len(before)
     _type_into_terminal(page, "", press_enter=True)
-    return _wait_for_prompt(page, timeout=timeout)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        after = _read_terminal(page) or ""
+        if len(after) > before_len:
+            return True
+        last = _last_nonempty_line(after)
+        if last and _PROMPT_RE.search(last):
+            return True
+        time.sleep(0.3)
+    return False
 
 
 def _cmd_check_port(page, parser, port_number):
+    """Run `serial --force N` and capture what the attached device says.
+
+    Flow:
+      1. Ping the terminal (bare Enter) — non-fatal responsiveness check
+      2. Send `serial --force N` + Enter
+      3. Wait 5s for the Cradlepoint serial session to attach (banner appears)
+      4. Snapshot output — this is our "empty port" baseline
+      5. Press Enter 3 times (2s apart) to elicit a response from the device
+      6. Read output again; anything beyond the baseline is the device's reply
+      7. Parse hostname from the device reply
+
+    Does NOT close the console — the caller (`_cmd_check_all_ports`) is
+    responsible for close/reopen cycles between ports.
+    """
     if port_number not in (1, 2, 3, 4):
         return PortResult(port=port_number, error="Invalid port number (must be 1-4)")
 
     try:
-        # Responsiveness check: a bare Enter should echo a bash prompt back.
-        # If the terminal is stuck, sending `serial --force N` is pointless —
-        # it would be swallowed silently and we'd time out later.
-        # (We rely on `serial --force N`'s --force flag to take over any
-        # existing session on ports 2–4 — no ~. exit sequence needed.)
-        if not _ping_terminal(page, timeout=8):
-            # One retry before giving up — terminals sometimes need a beat.
-            if not _ping_terminal(page, timeout=8):
-                shot = _save_debug_screenshot(page, f"port{port_number}_unresponsive")
-                msg = "Terminal unresponsive (no prompt after Enter)"
-                if shot:
-                    msg += f" — screenshot: {shot}"
-                return PortResult(port=port_number, error=msg)
+        # 1. Responsiveness check — informational only, not blocking.
+        if not _ping_terminal(page, timeout=6):
+            _save_debug_screenshot(page, f"port{port_number}_ping_inconclusive")
 
-        # Send the serial command.  (Note: we don't Ctrl+U to clear the line —
-        # Cradlepoint's bash reports it as "unhandled special key: 21".)
+        # 2. Send serial --force N.
         cmd = f"serial --force {port_number}"
         sent = _type_into_terminal(page, cmd, press_enter=True)
-
         if not sent:
             shot = _save_debug_screenshot(page, f"port{port_number}_no_input")
             msg = "Could not send command to terminal"
@@ -614,136 +653,155 @@ def _cmd_check_port(page, parser, port_number):
                 msg += f" — screenshot: {shot}"
             return PortResult(port=port_number, error=msg)
 
-        time.sleep(5)   # serial connection takes a moment to establish
+        # 3. Wait for the Cradlepoint serial-session banner.
+        time.sleep(5)
 
-        # Wake the attached device: send Enter and watch for output to change.
-        # Each nudge is only sent if the previous one produced nothing new.
-        output = _read_terminal(page)
-        for _ in range(4):
+        # 4. Baseline: whatever's in the terminal RIGHT after the banner.
+        #    Anything that appears after this point came from the attached
+        #    device in response to our Enter presses.
+        baseline = _read_terminal(page) or ""
+        baseline_len = len(baseline)
+
+        # 5. Three Enters, 2s apart, to wake the device.
+        for _ in range(3):
             _type_into_terminal(page, "", press_enter=True)
-            time.sleep(3)
-            new_output = _read_terminal(page)
-            if new_output != output and new_output.strip():
-                output = new_output
-                # Try parsing — if we got a hostname, we're done nudging.
-                result = parser.parse(output)
-                if result.hostname:
-                    break
-            output = new_output
+            time.sleep(2)
 
-        # Final parse on whatever we ended up with.
-        result = parser.parse(output) if output else parser.parse("")
+        # 6. Read final output and extract the device's reply.
+        final_output = _read_terminal(page) or ""
+        if len(final_output) > baseline_len and final_output.startswith(baseline):
+            device_reply = final_output[baseline_len:]
+        else:
+            # Output diverged from baseline (scrolled / re-rendered) — use it whole.
+            device_reply = final_output
+
+        # 7. Parse hostname from whatever the device gave back.
+        result = parser.parse(device_reply) if device_reply else parser.parse("")
+
+        # Classify: hostname found > got some reply > port empty.
+        if result.hostname:
+            error = None
+        elif device_reply.strip():
+            error = "Got response but no hostname detected"
+        else:
+            error = "No response from port — likely no device attached"
 
         return PortResult(
             port=port_number,
-            raw_output=output,
+            raw_output=device_reply,
             hostname=result.hostname,
             confidence=result.confidence,
-            error=None if (output and output.strip()) else "No response from port",
+            error=error,
         )
     except Exception as e:
         return PortResult(port=port_number, error=str(e))
 
 
 def _cmd_check_all_ports(page, parser):
+    """Check ports 1–4, closing and reopening the console between ports.
+
+    Cradlepoint's serial session doesn't cleanly hand off to the next port
+    with `serial --force` or `~.` — the only reliable reset is to close the
+    console entirely and reopen it.  First reopen can take a while, but
+    subsequent ones usually come back within ~180s.
+    """
     results = []
     for port in range(1, 5):
+        if port > 1:
+            try:
+                ready = _close_and_reopen_console(page, timeout_seconds=180)
+                if not ready:
+                    shot = _save_debug_screenshot(page, f"port{port}_reopen_timeout")
+                    msg = "Console did not come back within 180s after reopen"
+                    if shot:
+                        msg += f" — screenshot: {shot}"
+                    results.append(PortResult(port=port, error=msg))
+                    continue
+            except Exception as e:
+                shot = _save_debug_screenshot(page, f"port{port}_reopen_failed")
+                msg = f"Close/reopen failed: {e}"
+                if shot:
+                    msg += f" — screenshot: {shot}"
+                results.append(PortResult(port=port, error=msg))
+                continue
+
         result = _cmd_check_port(page, parser, port)
         results.append(result)
-        # _cmd_check_port already exits the serial session and sleeps 1s;
-        # no extra delay needed between ports.
     return results
+
+
+_TERMINAL_IFRAME_HINTS = ("aoobm", "haproxy", "console", "terminal", "remote")
 
 
 def _read_terminal(page) -> str:
     """Scrape text content from the NCM console terminal.
 
-    NCM's console is an Ember.js app — NOT xterm.js. The terminal is typically
-    a div/pre with a black background. We try multiple approaches to find it.
+    The terminal lives inside a cross-origin iframe served from
+    aoobm-haproxy.cradlepointecm.com.  We check iframes FIRST (prioritizing
+    URLs that look terminal-related), then fall back to the main frame.
+    Cross-origin iframes can't be read via the parent's innerText, so
+    iframe-first is the only reliable path.
     """
+    # ── Approach 1: iframes (terminal lives here) ──────────────────────────
     try:
-        text = page.evaluate("""() => {
-            // Strategy 1: xterm.js rows (in case NCM ever uses it)
-            const xtermRows = document.querySelectorAll('.xterm-rows > div');
-            if (xtermRows.length > 0) {
-                return Array.from(xtermRows).map(r => r.textContent).join('\\n');
-            }
-
-            // Strategy 2: Find elements with dark backgrounds (the terminal area)
-            const allEls = document.querySelectorAll('div, pre, textarea, span');
-            let bestTerminal = null;
-            let bestArea = 0;
-            for (const el of allEls) {
-                const style = window.getComputedStyle(el);
-                const bg = style.backgroundColor;
-                // Check for black/very dark backgrounds
-                const isBlack = bg === 'rgb(0, 0, 0)' || bg === '#000' || bg === '#000000'
-                    || bg === 'rgb(30, 30, 30)' || bg === 'rgb(33, 33, 33)';
-                if (isBlack && el.offsetHeight > 30 && el.offsetWidth > 100) {
-                    const area = el.offsetHeight * el.offsetWidth;
-                    if (area > bestArea) {
-                        bestArea = area;
-                        bestTerminal = el;
-                    }
-                }
-            }
-            if (bestTerminal) {
-                return bestTerminal.innerText || bestTerminal.textContent || '';
-            }
-
-            // Strategy 3: Named selectors
-            const selectors = [
-                '[class*="console-output"]', '[class*="console-terminal"]',
-                '[class*="terminal"]', '[class*="console"]',
-                '.xterm', '.terminal', 'pre',
-            ];
-            for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el && el.offsetHeight > 30) {
-                    const text = el.innerText || el.textContent || '';
-                    if (text.trim()) return text;
-                }
-            }
-
-            // Strategy 4: Look for any element containing a shell prompt
-            const body = document.body.innerText || '';
-            const lines = body.split('\\n');
-            // Find the section that looks like terminal output (contains $ or # prompts)
-            let terminalLines = [];
-            let inTerminal = false;
-            for (const line of lines) {
-                if (/[@].*[\\$#]\\s*$/.test(line) || /^[A-Za-z].*[#>]\\s*$/.test(line)) {
-                    inTerminal = true;
-                }
-                if (inTerminal) {
-                    terminalLines.push(line);
-                }
-            }
-            if (terminalLines.length > 0) {
-                return terminalLines.join('\\n');
-            }
-
-            return '';
-        }""")
-        if text and text.strip():
-            return text
-    except Exception:
-        pass
-
-    # Approach 2: check inside iframes
-    try:
-        frames = page.frames
+        frames = list(page.frames)
+        prioritized = []
+        others = []
         for frame in frames:
             if frame == page.main_frame:
                 continue
+            url = (frame.url or "").lower()
+            if any(h in url for h in _TERMINAL_IFRAME_HINTS):
+                prioritized.append(frame)
+            else:
+                others.append(frame)
+
+        for frame in prioritized + others:
             try:
                 text = frame.evaluate("""() => {
-                    return document.body ? (document.body.innerText || document.body.textContent || '') : '';
+                    // Prefer xterm.js rows if present
+                    const rows = document.querySelectorAll('.xterm-rows > div');
+                    if (rows.length > 0) {
+                        return Array.from(rows).map(r => r.textContent).join('\\n');
+                    }
+                    return document.body
+                        ? (document.body.innerText || document.body.textContent || '')
+                        : '';
                 }""")
                 if text and text.strip():
                     return text
             except Exception:
                 continue
+    except Exception:
+        pass
+
+    # ── Approach 2: main frame (fallback — rarely hits) ────────────────────
+    try:
+        text = page.evaluate("""() => {
+            const xtermRows = document.querySelectorAll('.xterm-rows > div');
+            if (xtermRows.length > 0) {
+                return Array.from(xtermRows).map(r => r.textContent).join('\\n');
+            }
+            // Look for dark-bg terminal container
+            const allEls = document.querySelectorAll('div, pre, textarea, span');
+            let bestTerminal = null;
+            let bestArea = 0;
+            for (const el of allEls) {
+                const bg = window.getComputedStyle(el).backgroundColor;
+                const isBlack = bg === 'rgb(0, 0, 0)' || bg === '#000' || bg === '#000000'
+                    || bg === 'rgb(30, 30, 30)' || bg === 'rgb(33, 33, 33)';
+                if (isBlack && el.offsetHeight > 30 && el.offsetWidth > 100) {
+                    const area = el.offsetHeight * el.offsetWidth;
+                    if (area > bestArea) { bestArea = area; bestTerminal = el; }
+                }
+            }
+            if (bestTerminal) {
+                return bestTerminal.innerText || bestTerminal.textContent || '';
+            }
+            return '';
+        }""")
+        if text and text.strip():
+            return text
     except Exception:
         pass
 
