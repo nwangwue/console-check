@@ -467,43 +467,258 @@ def _cmd_wait_for_user(page, parser):
     return True
 
 
+def _iter_frames(page):
+    """Yield the main page then all child frames (in case terminal is in an iframe)."""
+    yield page
+    try:
+        for frame in page.frames:
+            if frame != page.main_frame:
+                yield frame
+    except Exception:
+        pass
+
+
+def _find_input_locator(frame):
+    """Return a Playwright Locator for the terminal's input element in this frame.
+
+    Tries textareas first (xterm.js / hterm hidden-textarea pattern), then
+    falls back to the visible container div.  Returns None if nothing found.
+    """
+    textarea_sels = [
+        "textarea.xterm-helper-textarea",   # xterm.js canonical
+        ".xterm textarea",
+        ".terminal textarea",
+        "[class*='terminal'] textarea",
+        "[class*='console'] textarea",
+        "[class*='shell'] textarea",
+        "[class*='remote'] textarea",
+        "textarea",                          # anything at all
+    ]
+    for sel in textarea_sels:
+        try:
+            loc = frame.locator(sel).first
+            if loc.count() > 0:             # exists in DOM (even if hidden)
+                return loc
+        except Exception:
+            continue
+
+    # No textarea — try the visible terminal container div
+    for sel in [
+        SELECTORS["terminal"],
+        "[class*='console-output']",
+        "[class*='console-terminal']",
+        "[class*='remote-connect']",
+    ]:
+        try:
+            loc = frame.locator(sel).first
+            if loc.is_visible(timeout=500):
+                return loc
+        except Exception:
+            continue
+
+    return None
+
+
+def _type_into_terminal(page, text, press_enter=True):
+    """Send text (and optionally Enter) to the NCM terminal.
+
+    Tries three strategies in order, checking each frame (main + iframes):
+
+      A. locator.type()  — Playwright focuses the element and types directly.
+         This is the most reliable because focus is handled atomically.
+      B. JS focus → page.keyboard.type()  — fallback when no locator matched.
+      C. dispatchEvent()  — inject raw KeyboardEvents via JavaScript.
+
+    Returns True when the text is confirmed visible in the terminal output.
+    Returns False if all strategies failed (caller should save a screenshot).
+    """
+    frames = list(_iter_frames(page))
+
+    # ── A: locator.type() ──────────────────────────────────────────────────
+    for frame in frames:
+        loc = _find_input_locator(frame)
+        if loc is None:
+            continue
+        try:
+            loc.focus(timeout=1500)
+            time.sleep(0.15)
+            if text:
+                loc.type(text, delay=40)
+            if press_enter:
+                loc.press("Enter")
+            time.sleep(0.4)
+            if not text:
+                return True                          # bare Enter — assume OK
+            if _text_visible_in_terminal(page, text):
+                return True
+        except Exception:
+            pass
+
+    # ── B: JS focus → page.keyboard ───────────────────────────────────────
+    for frame in frames:
+        try:
+            frame.evaluate("""() => {
+                const sels = [
+                    'textarea.xterm-helper-textarea', '.terminal textarea',
+                    "[class*='terminal'] textarea", "[class*='console'] textarea",
+                    'textarea',
+                ];
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (el) { el.focus(); return; }
+                }
+                // Dark-background terminal container
+                for (const el of document.querySelectorAll('div, pre')) {
+                    const bg = window.getComputedStyle(el).backgroundColor;
+                    if (['rgb(0, 0, 0)', 'rgb(30, 30, 30)', 'rgb(12, 12, 12)'].includes(bg)
+                            && el.offsetHeight > 50 && el.offsetWidth > 100) {
+                        const ta = el.querySelector('textarea');
+                        if (ta) { ta.focus(); return; }
+                        el.click(); el.focus(); return;
+                    }
+                }
+            }""")
+            time.sleep(0.25)
+            if text:
+                page.keyboard.type(text, delay=40)
+            if press_enter:
+                page.keyboard.press("Enter")
+            time.sleep(0.4)
+            if not text:
+                return True
+            if _text_visible_in_terminal(page, text):
+                return True
+        except Exception:
+            pass
+
+    # ── C: KeyboardEvent injection ─────────────────────────────────────────
+    for frame in frames:
+        try:
+            frame.evaluate("""(payload) => {
+                const target =
+                    document.querySelector('textarea.xterm-helper-textarea') ||
+                    document.querySelector('.terminal textarea')            ||
+                    document.querySelector("[class*='terminal'] textarea")  ||
+                    document.querySelector('textarea')                      ||
+                    document.activeElement                                  ||
+                    document.body;
+                target.focus();
+                const chars = payload.text ? [...payload.text] : [];
+                if (payload.enter) chars.push('\\n');
+                for (const ch of chars) {
+                    const isEnter = ch === '\\n';
+                    const key  = isEnter ? 'Enter' : ch;
+                    const code = isEnter ? 13 : ch.charCodeAt(0);
+                    for (const t of ['keydown', 'keypress', 'keyup']) {
+                        target.dispatchEvent(new KeyboardEvent(t, {
+                            key, keyCode: code, charCode: code, which: code,
+                            bubbles: true, cancelable: true
+                        }));
+                    }
+                    if (!isEnter && (target.tagName==='TEXTAREA'||target.tagName==='INPUT')) {
+                        target.value += ch;
+                        target.dispatchEvent(new InputEvent('input', { data: ch, bubbles: true }));
+                    }
+                }
+            }""", {"text": text, "enter": press_enter})
+            time.sleep(0.4)
+            if not text:
+                return True
+            if _text_visible_in_terminal(page, text):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _text_visible_in_terminal(page, text) -> bool:
+    """Check whether text (or its last word) is visible in the terminal."""
+    try:
+        out = _read_terminal(page)
+        if not out:
+            return False
+        last_word = text.split()[-1] if text.split() else text
+        return last_word in out
+    except Exception:
+        return False
+
+
+def _save_debug_screenshot(page, label: str) -> str | None:
+    """Save a timestamped debug screenshot and return the path."""
+    try:
+        debug_dir = Path.home() / ".console-check"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        path = str(debug_dir / f"debug_{label}.png")
+        page.screenshot(path=path)
+        return path
+    except Exception:
+        return None
+
+
+def _exit_serial_session(page):
+    """Disconnect from the current serial session using the ~. escape sequence.
+
+    The tilde-dot must be the first characters on a new line.  We send Enter
+    first to guarantee that, then ~ and . as separate characters.
+    """
+    _type_into_terminal(page, "", press_enter=True)   # land on a new line
+    time.sleep(0.3)
+    _type_into_terminal(page, "~.", press_enter=False)
+    time.sleep(2)   # wait for Cradlepoint bash prompt to return
+
+
 def _cmd_check_port(page, parser, port_number):
     if port_number not in (1, 2, 3, 4):
         return PortResult(port=port_number, error="Invalid port number (must be 1-4)")
 
     try:
-        # Click somewhere on the page to ensure focus is on the console area.
-        # Try clicking the terminal/console area, or just the body.
-        _focus_terminal(page)
+        # For ports 2–4, exit the previous serial session first so we're back
+        # at the Cradlepoint bash shell before issuing the next command.
+        if port_number > 1:
+            _exit_serial_session(page)
+            time.sleep(1)
 
-        # Type the serial command
-        page.keyboard.type(f"serial --force {port_number}")
-        page.keyboard.press("Enter")
-        time.sleep(5)  # Serial connection takes a moment
+        # Clear any partial line (Ctrl+U) before typing the command
+        _type_into_terminal(page, "", press_enter=False)   # wake focus
+        page.keyboard.press("Control+U")
+        time.sleep(0.2)
 
-        # Send Enters to wake the device
-        page.keyboard.press("Enter")
+        # Send the serial command
+        cmd = f"serial --force {port_number}"
+        sent = _type_into_terminal(page, cmd, press_enter=True)
+
+        if not sent:
+            # Input never reached the terminal — save screenshot and report
+            shot = _save_debug_screenshot(page, f"port{port_number}_no_input")
+            msg = "Could not send command to terminal"
+            if shot:
+                msg += f" — screenshot: {shot}"
+            return PortResult(port=port_number, error=msg)
+
+        time.sleep(5)   # serial connection takes a moment to establish
+
+        # Wake the connected device with a couple of Enter presses
+        _type_into_terminal(page, "", press_enter=True)
         time.sleep(2)
-        page.keyboard.press("Enter")
+        _type_into_terminal(page, "", press_enter=True)
         time.sleep(3)
 
-        # Retry loop: read output and try to parse a hostname.
-        # The serial connection may take a while to fully establish —
-        # keep sending Enters and re-reading until we find a hostname
-        # or exhaust our retry budget.
+        # Retry: read output and nudge until we get a hostname or exhaust budget
         output = ""
         result = parser.parse("")
-        for retry in range(5):
+        for retry in range(4):
             output = _read_terminal(page)
-
             if output and output.strip():
                 result = parser.parse(output)
                 if result.hostname:
-                    break  # Found a hostname, we're done
+                    break
+            _type_into_terminal(page, "", press_enter=True)
+            time.sleep(4)
 
-            # No hostname yet — send Enter to nudge the device and wait
-            page.keyboard.press("Enter")
-            time.sleep(3 if retry < 2 else 5)
+        # Exit the serial session so the next port starts from bash
+        _exit_serial_session(page)
+        time.sleep(1)
 
         return PortResult(
             port=port_number,
@@ -516,54 +731,13 @@ def _cmd_check_port(page, parser, port_number):
         return PortResult(port=port_number, error=str(e))
 
 
-def _focus_terminal(page):
-    """Click on the terminal/console area to ensure keyboard focus."""
-    # Try known terminal selectors first
-    for selector in [
-        SELECTORS["terminal"],
-        '[class*="console-output"]',
-        '[class*="console-terminal"]',
-    ]:
-        try:
-            el = page.locator(selector).first
-            if el.is_visible(timeout=1000):
-                el.click()
-                time.sleep(0.3)
-                return
-        except Exception:
-            continue
-
-    # Fallback: use JS to find the element with dark background (the terminal)
-    try:
-        page.evaluate("""() => {
-            // Find elements with dark background that look like a terminal
-            const allEls = document.querySelectorAll('div, pre, textarea');
-            for (const el of allEls) {
-                const style = window.getComputedStyle(el);
-                const bg = style.backgroundColor;
-                // Check for black or very dark backgrounds
-                if (bg === 'rgb(0, 0, 0)' || bg === '#000' || bg === '#000000' ||
-                    bg === 'rgb(30, 30, 30)' || bg === 'rgb(33, 33, 33)') {
-                    if (el.offsetHeight > 50 && el.offsetWidth > 100) {
-                        el.click();
-                        el.focus();
-                        return;
-                    }
-                }
-            }
-        }""")
-        time.sleep(0.3)
-    except Exception:
-        pass
-
-
 def _cmd_check_all_ports(page, parser):
     results = []
     for port in range(1, 5):
         result = _cmd_check_port(page, parser, port)
         results.append(result)
-        if port < 4:
-            time.sleep(1)
+        # _cmd_check_port already exits the serial session and sleeps 1s;
+        # no extra delay needed between ports.
     return results
 
 
@@ -732,12 +906,16 @@ class NCMAutomation:
                 self._thread.join(timeout=10)
             self._started = False
 
-    def _call(self, method: str, *args, **kwargs):
-        """Send a command to the worker thread and wait for the result."""
+    def _call(self, method: str, *args, timeout: int = 600, **kwargs):
+        """Send a command to the worker thread and wait for the result.
+
+        Default timeout is 600s — long commands like open_console (up to 360s)
+        and check_all_ports (multiple ports × retries) need the extra headroom.
+        """
         if not self._started:
             raise RuntimeError("Browser not started. Call start() first.")
         self._cmd_q.put((method, args, kwargs))
-        status, result = self._result_q.get(timeout=120)
+        status, result = self._result_q.get(timeout=timeout)
         if status == "error":
             raise result
         return result

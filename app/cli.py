@@ -3,6 +3,13 @@
 import argparse
 import sys
 
+# Force UTF-8 output on Windows — prevents UnicodeEncodeError when Rich renders
+# special characters (→, ✓, ✗, —) through the legacy Windows console (cp1252).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import questionary
 from rich.console import Console
 
